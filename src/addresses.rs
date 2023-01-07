@@ -1,9 +1,9 @@
 use std::fmt::Debug;
-use std::net::{self, ToSocketAddrs};
+use std::net::{self, IpAddr, SocketAddr, ToSocketAddrs};
 
-use crate::util::BytesConcat;
+use crate::util::{BytesConcat, ToBytes};
 
-#[derive(Clone, Copy, Hash, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 pub(crate) struct Addr {
     addr: net::Ipv6Addr,
     port: u16,
@@ -24,9 +24,10 @@ impl net::ToSocketAddrs for Addr {
 }
 
 impl Addr {
-    pub fn from_bytes(recv: &[u8]) -> Option<Addr> {
-        if recv.len() != 18 {
-            // 16 (IPv6) + 2 (port)
+    pub(crate) const LENGTH_IN_BYTES: usize = 18; // 16 (IPv6) + 2 (port)
+
+    pub(crate) fn from_bytes(recv: &[u8]) -> Option<Addr> {
+        if recv.len() != Addr::LENGTH_IN_BYTES {
             return None;
         }
 
@@ -39,5 +40,26 @@ impl Addr {
         let port = (port[0], port[1]).concat();
 
         Some(Addr { addr, port })
+    }
+}
+
+impl ToBytes for Addr {
+    fn to_bytes(&self) -> Vec<u8> {
+        let bytes = vec![];
+        bytes.extend(self.addr.octets());
+        bytes.extend(self.port.to_bytes());
+        bytes
+    }
+}
+
+impl From<SocketAddr> for Addr {
+    fn from(value: SocketAddr) -> Self {
+        let port = value.port();
+        let addr = value.ip();
+        let addr = match addr {
+            IpAddr::V6(ip) => ip,
+            IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+        };
+        Addr { addr, port }
     }
 }

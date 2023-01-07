@@ -1,15 +1,17 @@
-#![feature(try_trait_v2)]
-#![feature(option_result_contains)]
-
-use protocol::LocalState;
 use std::net::UdpSocket;
 
+use protocol::LocalPeerSocket;
+
 mod addresses;
+mod datetime;
+mod error;
+mod parse;
 mod protocol;
 mod util;
 
-pub fn run_client(state: &mut LocalState, port: u16) -> std::io::Result<()> {
+pub fn run_client(state: &mut LocalPeerSocket, port: u16) -> std::io::Result<()> {
     let socket = UdpSocket::bind(("::1", port))?;
+    while true {}
     Ok(())
 }
 
