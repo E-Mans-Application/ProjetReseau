@@ -1,16 +1,20 @@
 extern crate rand;
 
+use std::collections::hash_map::Iter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::io::Write;
 use std::net::UdpSocket;
-use std::rc::Rc;
+use std::ops::{Deref, DerefMut};
+use std::rc::{Rc, Weak};
 use std::sync::{RwLock, RwLockWriteGuard};
 
 use self::rand::rngs::ThreadRng;
 use self::rand::Rng;
 use crate::datetime::{self, DateTime};
-use crate::error::{DeliveryResult, MessageDeliveryError, ParseError, ParseResult};
+use crate::error::{
+    AggregateError, AggregateResult, DeliveryResult, MessageDeliveryError, ParseError, ParseResult,
+};
 use crate::parse::MessageParser;
 use crate::util::{
     Data, GoAwayReason, LimitedString, MessageId, PeerID, ServiceDataUnit, ServiceDataUnitFactory,
@@ -27,7 +31,26 @@ struct ActiveNeighbour<'arena> {
     last_long_hello: DateTime,
 }
 
-impl ActiveNeighbour<'_> {
+impl<'arena> ActiveNeighbour<'arena> {
+    fn new(id: PeerID, addr: &'arena Addr, symmetric: bool) -> ActiveNeighbour<'arena> {
+        let last_hello = datetime::now();
+        let last_long_hello = if symmetric {
+            last_hello
+        } else {
+            datetime::never()
+        };
+        ActiveNeighbour {
+            id,
+            addr,
+            last_hello,
+            last_long_hello,
+        }
+    }
+
+    fn mark_symmetric(&mut self) {
+        self.last_long_hello = datetime::now();
+    }
+
     fn is_symmetric(&self) -> bool {
         datetime::millis_since(self.last_long_hello) < LocalUser::SYMMETRY_TIMEOUT
     }
@@ -44,20 +67,31 @@ impl<'arena> ActiveNeighbourMap<'arena> {
         ActiveNeighbourMap(RwLock::new(HashMap::new()))
     }
 
+    fn remove(&self, addr: &'arena Addr) {
+        self.0.write().unwrap().remove(addr);
+    }
+
+    fn mark_active(&self, addr: &'arena Addr, id: PeerID, symmetric: bool) {
+        self.0
+            .write()
+            .unwrap()
+            .insert(addr, ActiveNeighbour::new(id, addr, symmetric));
+    }
+
     fn mark_inactive(
         &self,
-        addr: &Addr,
+        addr: &'arena Addr,
         socket: &MircHost,
         msg: Option<String>,
     ) -> DeliveryResult<()> {
-        self.0.write().unwrap().remove(addr);
+        self.remove(addr);
 
         socket.send_single_tlv(
             addr,
             TagLengthValue::GoAway(
                 GoAwayReason::Inactivity,
                 msg.map(|str| {
-                    // whatever, the error is (supposed to be) used when receiving the TLV,
+                    // the error is (supposed to be) used when receiving the TLV,
                     // it is ignored when sending it.
                     LimitedString::try_from(str).map_err(|_| ParseError::ProtocolViolation)
                 }),
@@ -65,10 +99,19 @@ impl<'arena> ActiveNeighbourMap<'arena> {
         )
     }
 
-    fn mark_all_inactives(&self, who: Vec<&Addr>, socket: &MircHost, msg: Option<String>) {
+    fn mark_all_inactive(
+        &self,
+        who: Vec<&'arena Addr>,
+        socket: &MircHost,
+        msg: Option<String>,
+    ) -> AggregateResult<(), MessageDeliveryError> {
+        let mut err = AggregateError::NoMoreError;
+
         for addr in who {
-            self.mark_inactive(addr, socket, msg);
+            err = err.aggregate_result(self.mark_inactive(addr, socket, msg.clone()));
         }
+
+        err.into()
     }
 
     fn is_symmetric(&self, addr: &Addr) -> bool {
@@ -79,9 +122,13 @@ impl<'arena> ActiveNeighbourMap<'arena> {
             .is_some_and(|n| n.is_symmetric())
     }
 
-    fn fold<T, F>(&self, init: T, f: F) -> T
+    fn count_symmetrics(&self) -> usize {
+        self.fold(0, |_, n, c| if n.is_symmetric() { c + 1 } else { c })
+    }
+
+    fn fold<T, F>(&self, init: T, mut f: F) -> T
     where
-        F: Fn(&Addr, &ActiveNeighbour, T) -> T,
+        F: FnMut(&'arena Addr, &ActiveNeighbour, T) -> T,
     {
         let mut result = init;
         for (addr, neighbour) in self.0.read().unwrap().iter() {
@@ -89,23 +136,65 @@ impl<'arena> ActiveNeighbourMap<'arena> {
         }
         result
     }
+
+    fn broadcast_neighbourhood(
+        &self,
+        socket: &MircHost,
+    ) -> AggregateResult<(), MessageDeliveryError> {
+        let mut keys = vec![];
+        let mut queue = VecDeque::new();
+
+        for (addr, neighbour) in self.0.read().unwrap().iter() {
+            if neighbour.is_symmetric() {
+                queue.push_back(TagLengthValue::Neighbour((*addr).clone()));
+            }
+            keys.push(*addr);
+        }
+        socket.send_many_tlvs(&keys, queue)
+    }
+
+    fn say_hello(
+        &self,
+        id: PeerID,
+        socket: &MircHost,
+    ) -> AggregateResult<(), MessageDeliveryError> {
+        let mut inactives = vec![];
+
+        let mut err = AggregateError::NoMoreError;
+
+        for (addr, neighbour) in self.0.read().unwrap().iter() {
+            if datetime::millis_since(neighbour.last_hello) > LocalUser::ACTIVITY_TIMEOUT {
+                inactives.push(*addr);
+            } else {
+                let hello = TagLengthValue::Hello(id, Some(neighbour.id));
+                err = err.aggregate_result(socket.send_single_tlv(addr, hello));
+            }
+        }
+        err = err.aggregate_result_flatten(self.mark_all_inactive(
+            inactives,
+            socket,
+            Some("You have been idle for too long.".to_owned()),
+        ));
+
+        err.into()
+    }
 }
 
 /* #endregion */
 
 /* #region FloodingState */
 
-struct FloodingState {
-    addr: Rc<Addr>,
-    data: Rc<DataToFlood>,
+struct FloodingState<'arena> {
+    addr: &'arena Addr,
     flooding_times: u8,
     last_flooding: DateTime,
     next_flooding_delay: u128,
 }
 
-impl FloodingState {
-    fn new(time: DateTime, rng: &mut ThreadRng) -> FloodingState {
+impl<'arena> FloodingState<'arena> {
+    fn new(time: DateTime, addr: &'arena Addr, rng: &mut ThreadRng) -> FloodingState<'arena> {
         let mut state = FloodingState {
+            addr,
             flooding_times: 0,
             last_flooding: time,
             next_flooding_delay: 0,
@@ -120,13 +209,12 @@ impl FloodingState {
 
     fn flood(
         &mut self,
-        to: &Addr,
         msg: &ServiceDataUnit,
         socket: &MircHost,
         rng: &mut ThreadRng,
     ) -> DeliveryResult<()> {
         if self.should_flood() {
-            socket.send_sdu(to, msg)?;
+            socket.send_sdu(self.addr, msg)?;
             self.flooded(rng);
 
             if self.should_give_up_flooding() {
@@ -165,26 +253,25 @@ impl FloodingState {
 
 /* #region DataToFlood */
 
-struct DataToFlood {
+struct DataToFlood<'arena> {
     receive_time: DateTime,
-    msg_id: Rc<MessageId>,
-    data: Data,
-    neighbours_to_flood: HashMap<&'arena Addr, FloodingState>,
+    msg_id: MessageId,
+    data: Rc<Data>,
+    neighbours_to_flood: HashMap<&'arena Addr, FloodingState<'arena>>,
 }
 
 impl<'arena> DataToFlood<'arena> {
     fn new(
-        msg_id: &MessageId,
-        data: Data,
-        neighbours: ActiveNeighbourMap<'arena>,
+        msg_id: MessageId,
+        data: Rc<Data>,
+        neighbours: &ActiveNeighbourMap<'arena>,
         rng: &mut ThreadRng,
     ) -> DataToFlood<'arena> {
-
         let date = datetime::now();
 
-        let mut neighbours_to_flood = neighbours.fold(HashMap::new(), |addr, n, v| {
+        let neighbours_to_flood = neighbours.fold(HashMap::new(), |addr, n, mut v| {
             if n.is_symmetric() {
-                v.insert(addr, FloodingState::new(date, rng));
+                v.insert(addr, FloodingState::new(date, addr, rng));
             }
             v
         });
@@ -208,17 +295,19 @@ impl<'arena> DataToFlood<'arena> {
         &mut self,
         socket: &MircHost,
         rng: &mut ThreadRng,
-        tva: &ActiveNeighbourMap,
-    ) -> DeliveryResult<()> {
+        tva: &ActiveNeighbourMap<'arena>,
+    ) -> AggregateResult<(), MessageDeliveryError> {
+        let mut err = AggregateError::NoMoreError;
+
         let msg = vec![TagLengthValue::Data(self.msg_id, self.data.clone())];
         let mut inactives = vec![];
 
         for (addr, state) in self.neighbours_to_flood.iter_mut() {
             if tva.is_symmetric(addr) {
-                match state.flood(addr, &msg, socket, rng) {
+                match state.flood(&msg, socket, rng) {
                     Ok(()) => (),
                     Err(MessageDeliveryError::NeighbourInactive) => inactives.push(*addr),
-                    Err(_) => { /* TODO */ }
+                    Err(e) => err = err.aggregate(e),
                 }
             } else {
                 state.give_up_flooding();
@@ -227,17 +316,69 @@ impl<'arena> DataToFlood<'arena> {
 
         self.neighbours_to_flood
             .retain(|_, state| !state.should_give_up_flooding());
-        tva.mark_all_inactives(
+
+        err = err.aggregate_result_flatten(tva.mark_all_inactive(
             inactives,
             socket,
             Some("You did not acknoledge a message on time".to_owned()),
-        );
+        ));
 
-        Ok(())
+        err.into()
     }
 }
 
 /* #endregion */
+
+struct DataToFloodCollection<'arena>(RwLock<HashMap<MessageId, RwLock<DataToFlood<'arena>>>>);
+
+impl<'arena> DataToFloodCollection<'arena> {
+    fn new() -> DataToFloodCollection<'arena> {
+        DataToFloodCollection(RwLock::new(HashMap::new()))
+    }
+
+    fn insert_data(
+        &self,
+        msg_id: MessageId,
+        data: Rc<Data>,
+        neighbours: &ActiveNeighbourMap<'arena>,
+        mut rng: RwLockWriteGuard<ThreadRng>,
+    ) -> bool {
+        let data = DataToFlood::new(msg_id, data, neighbours, &mut *rng);
+        self.0
+            .write()
+            .unwrap()
+            .try_insert(msg_id, RwLock::new(data))
+            .is_ok()
+    }
+
+    fn flood_all(
+        &self,
+        socket: &MircHost,
+        rng: &mut ThreadRng,
+        neighbours: &ActiveNeighbourMap<'arena>,
+    ) -> AggregateResult<(), MessageDeliveryError> {
+        let mut err = AggregateError::NoMoreError;
+
+        for (_, data) in self.0.read().unwrap().iter() {
+            err =
+                err.aggregate_result_flatten(data.write().unwrap().flood(socket, rng, neighbours));
+        }
+        self.0
+            .write()
+            .unwrap()
+            .retain(|_, data| !data.read().unwrap().flooding_complete());
+
+        err.into()
+    }
+
+    fn process_ack(&self, from: &Addr, msg_id: &MessageId) {
+        self.0
+            .read()
+            .unwrap()
+            .get(msg_id)
+            .inspect(|data| data.write().unwrap().process_ack(from));
+    }
+}
 
 /* #region MircHost */
 
@@ -271,7 +412,11 @@ impl MircHost {
         self.send_sdu(to, &vec![tlv])
     }
 
-    fn send_many_tlvs(&self, to: &[&Addr], tlvs: VecDeque<TagLengthValue>) -> DeliveryResult<()> {
+    fn send_many_tlvs(
+        &self,
+        to: &[&Addr],
+        tlvs: VecDeque<TagLengthValue>,
+    ) -> AggregateResult<(), MessageDeliveryError> {
         let mut factory = ServiceDataUnitFactory::new(tlvs);
         loop {
             let msg = factory.next_message();
@@ -305,7 +450,7 @@ pub(crate) struct LocalUser<'arena> {
     tvp: HashSet<&'arena Addr>,
     tva: ActiveNeighbourMap<'arena>,
     next_msg_id: RwLock<u32>,
-    data: RwLock<HashMap<MessageId, RwLock<DataToFlood<'arena>>>>,
+    data: DataToFloodCollection<'arena>,
     rng: RwLock<rand::rngs::ThreadRng>,
 }
 
@@ -342,11 +487,15 @@ impl<'arena> LocalUser<'arena> {
             tvp: HashSet::new(),
             tva: ActiveNeighbourMap::new(),
             next_msg_id: RwLock::new(0),
-            data: RwLock::new(HashMap::new()),
+            data: DataToFloodCollection::new(),
             rng: RwLock::new(rand::thread_rng()),
         };
         socket.hashcons(first_neighbour);
         Ok(socket)
+    }
+
+    fn get_rng(&self) -> RwLockWriteGuard<ThreadRng> {
+        self.rng.write().unwrap()
     }
 
     fn hashcons(&mut self, addr: Addr) -> &'arena Addr {
@@ -382,83 +531,51 @@ impl<'arena> LocalUser<'arena> {
         )
     }
 
-    fn process_ack(&self, from: &Addr, msg_id: &MessageId) {
-        self.data
-            .read()
-            .unwrap()
-            .get(msg_id)
-            .map(|data| data.write().unwrap().process_ack(from));
-
-        if self
-            .data
-            .read()
-            .unwrap()
-            .get(&msg_id)
-            .is_some_and(|f| f.read().unwrap().flooding_complete())
-        {
-            self.data.write().unwrap().remove(&msg_id);
-        }
-    }
-
     /// Process a single TLV from a received datagram.
     /// 'sender' is the address of the peer that sent the datagram.
     fn process_tlv(&mut self, sender: &'arena Addr, tlv: TagLengthValue) {
         match tlv {
             TagLengthValue::Hello(sender_id, receiver) => {
-                let mut tva = self.tva.write().unwrap();
-                let neighbour = tva
-                    .entry(sender)
-                    .or_insert((sender_id, datetime::never(), datetime::never()).into());
-
-                neighbour.last_hello = datetime::now();
-
-                let self_id = self.id;
-                neighbour.last_long_hello = receiver
-                    .filter(|id| *id == self_id)
-                    .map_or(neighbour.last_long_hello, |_| datetime::now());
+                self.tva
+                    .mark_active(sender, sender_id, receiver.contains(&self.id));
             }
+
             TagLengthValue::Neighbour(addr) => {
                 self.hashcons(addr);
             }
+
             TagLengthValue::Data(msg_id, data) => {
-                if self
-                    .tva
-                    .read()
-                    .unwrap()
-                    .get(sender)
-                    .is_some_and(|n| n.is_symmetric())
-                {
-                    if !self.data.read().unwrap().contains_key(&msg_id) {
+                if self.tva.is_symmetric(sender) {
+                    if self
+                        .data
+                        .insert_data(msg_id, data.clone(), &self.tva, self.get_rng())
+                    {
                         //TODO show data
-
                         std::io::stdout().lock().write(data.to_bytes().as_slice());
-
-                        DataToFlood::new(msg_id, data, self.tva, self.rng.write().unwrap());
-
-                        let flooding = self.prepare_flooding(datetime::now(), data);
-                        self.data
-                            .write()
-                            .unwrap()
-                            .insert(msg_id, RwLock::new(flooding));
                     }
-
-                    self.process_ack(sender, &msg_id);
-                    self.send_ack(sender, &msg_id);
                 }
+
+                self.data.process_ack(sender, &msg_id);
+                self.send_ack(sender, &msg_id);
             }
+
             TagLengthValue::Ack(msg_id) => {
-                self.process_ack(sender, &msg_id);
+                self.data.process_ack(sender, &msg_id);
             }
+
             TagLengthValue::GoAway(reason, msg) => {
                 // TODO verbose
-                self.tva.write().unwrap().remove(sender);
+                self.tva.remove(sender)
             }
+
             TagLengthValue::Warning(msg) => {
                 // TODO verbose
             }
+
             TagLengthValue::Unrecognized(tag, _) => {
                 self.send_warning(sender, format!("Unrecognized tag {0} was ignored.", tag));
             }
+
             TagLengthValue::Illegal(tag, _) => {
                 self.send_warning(
                     sender,
@@ -469,93 +586,22 @@ impl<'arena> LocalUser<'arena> {
         }
     }
 
-    fn send_hellos(&mut self) {
-        let mut symmetrics = 0;
-        let mut inactives = vec![];
-
-        for (addr, neighbour) in self.tva.read().unwrap().iter() {
-            if datetime::millis_since(neighbour.last_hello) > LocalUser::ACTIVITY_TIMEOUT {
-                inactives.push(*addr);
-            } else {
-                if neighbour.is_symmetric() {
-                    symmetrics += 1;
-                }
-                let hello = TagLengthValue::Hello(self.id, Some(neighbour.id));
-                self.send_single_tlv(addr, hello);
-            }
-        }
-        for inactive in inactives {
-            self.mark_inactive(inactive, None);
-        }
-        if symmetrics < LocalUser::min_NS {
-            for addr in self.tvp.iter() {
-                if !self.tva.read().unwrap().contains_key(addr) {
-                    let hello = TagLengthValue::Hello(self.id, None);
-                    self.send_single_tlv(addr, hello);
-                }
-            }
-        }
-    }
-
-    fn brodcast_neighbourhood(&self) {
-        let mut queue = VecDeque::new();
-        for (addr, neighbour) in self.tva.read().unwrap().iter() {
-            if neighbour.is_symmetric() {
-                queue.push_back(TagLengthValue::Neighbour((*addr).clone()));
-            }
-        }
-    }
-
-    fn flood_message(&self, msg_id: &MessageId, data: &mut DataToFlood<'arena>) {
-        let msg = vec![TagLengthValue::Data(*msg_id, data.data.clone())];
-
-        for (addr, state) in data.neighbours_to_flood.iter_mut() {
-            if datetime::millis_since(state.last_flooding) > state.next_flooding_delay {
-                match self.send_sdu(addr, &msg) {
-                    Ok(()) => state.flooded(datetime::now(), self.rng.write().unwrap()),
-                    _ => { /* TODO */ }
-                }
-            }
-        }
-    }
-
-    fn flood_all_messages(&self, inactives: &mut HashSet<&'arena Addr>) {
-        for (msg_id, data) in self.data.read().unwrap().iter() {
-            let data = &mut *data.write().unwrap();
-            self.flood_message(msg_id, data);
-
-            data.neighbours_to_flood
-                .drain_filter(|_, state| state.flooding_times >= LocalUser::MAX_FLOODING_TIMES)
-                .for_each(|(addr, _)| {
-                    inactives.insert(addr);
-                });
-            break;
-        }
-    }
-
     pub(crate) fn routine(&mut self) {
         if datetime::millis_since(self.last_hello) > LocalUser::HELLO_INTERVAL {
-            self.send_hellos();
+            self.tva.say_hello(self.id, &self.socket);
             self.last_hello = datetime::now();
         }
 
         if datetime::millis_since(self.last_neighbourhood)
             > LocalUser::NEIGHBOURHOOD_BROADCAST_INTERVAL
         {
-            self.brodcast_neighbourhood();
+            self.tva.broadcast_neighbourhood(&self.socket);
             self.last_neighbourhood = datetime::now();
         }
 
-        let mut inactives = HashSet::new();
-        self.flood_all_messages(&mut inactives);
+        self.data
+            .flood_all(&self.socket, &mut *self.get_rng(), &self.tva);
 
-        for inactive in inactives {
-            self.tva.mark_inactive(
-                inactive,
-                &self.socket,
-                Some("You didn't acknoledge a message in time.".to_owned()),
-            );
-        }
         self.receive_message();
     }
 
@@ -581,16 +627,12 @@ impl<'arena> LocalUser<'arena> {
         let data_vec = Data::pack(&data);
 
         for data in data_vec {
-            let receive_time = datetime::now();
-            let data = self.prepare_flooding(receive_time, data);
-
             let next_id = &mut *self.next_msg_id.write().unwrap();
             *next_id += 1;
 
+            let msg_id = (self.id, *next_id);
             self.data
-                .write()
-                .unwrap()
-                .insert((self.id, *next_id), RwLock::new(data));
+                .insert_data(msg_id, Rc::new(data), &self.tva, self.get_rng());
         }
     }
 }

@@ -6,6 +6,7 @@ use crate::error::{ParseError, ParseResult, SerializationError, SerializationRes
 use crate::parse::{self, BytesStreamReader};
 use std::collections::VecDeque;
 use std::convert::TryFrom;
+use std::rc::Rc;
 
 pub(crate) const PROTOCOL_MAGIC: u8 = 95;
 pub(crate) const PROTOCOL_VERSION: u8 = 0;
@@ -229,7 +230,7 @@ pub(crate) enum TagLengthValue {
     PadN(usize),
     Hello(PeerID, Option<PeerID>),
     Neighbour(Addr),
-    Data(MessageId, Data),
+    Data(MessageId, Rc<Data>),
     Ack(MessageId),
     GoAway(GoAwayReason, Option<ParseResult<LimitedString<254>>>),
     Warning(LimitedString<255>),
@@ -304,7 +305,10 @@ impl TagLengthValue {
                     // Check
                     let data = Data::try_from(data).ok()?;
 
-                    Some(TagLengthValue::Data((sender, msg_id.concat()), data))
+                    Some(TagLengthValue::Data(
+                        (sender, msg_id.concat()),
+                        Rc::new(data),
+                    ))
                 } else {
                     // ACK
                     Some(TagLengthValue::Ack((sender, msg_id.concat())))
@@ -530,6 +534,12 @@ pub(crate) trait ToBytes {
 }
 pub(crate) trait TryToBytes {
     fn try_to_bytes(&self) -> SerializationResult<Vec<u8>>;
+}
+
+impl TryToBytes for Vec<u8> {
+    fn try_to_bytes(&self) -> SerializationResult<Vec<u8>> {
+        Ok(self.clone())
+    }
 }
 
 impl ConstantByteLength for u16 {

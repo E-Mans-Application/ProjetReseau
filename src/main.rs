@@ -1,6 +1,8 @@
 #![feature(hash_drain_filter)]
 #![feature(is_some_and)]
 #![feature(result_option_inspect)]
+#![feature(option_result_contains)]
+#![feature(map_try_insert)]
 
 extern crate clap;
 extern crate crossbeam;
