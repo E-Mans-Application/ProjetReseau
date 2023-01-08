@@ -1,9 +1,9 @@
 use std::fmt::Debug;
 use std::net::{self, IpAddr, SocketAddr, ToSocketAddrs};
 
-use crate::util::{BytesConcat, ToBytes};
+use crate::util::{BytesConcat, ConstantByteLength, ToBytes};
 
-#[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
+#[derive(PartialEq, Eq, Clone, Hash, Debug)]
 pub(crate) struct Addr {
     addr: net::Ipv6Addr,
     port: u16,
@@ -33,7 +33,7 @@ impl Addr {
 
         let (addr, port) = recv.split_at(16);
 
-        let addr_bytes = [0u8; 16];
+        let mut addr_bytes = [0u8; 16];
         addr_bytes.clone_from_slice(addr);
 
         let addr = net::Ipv6Addr::from(addr_bytes);
@@ -43,9 +43,13 @@ impl Addr {
     }
 }
 
+impl ConstantByteLength for Addr {
+    const LENGTH_IN_BYTES: usize = 18;
+}
+
 impl ToBytes for Addr {
     fn to_bytes(&self) -> Vec<u8> {
-        let bytes = vec![];
+        let mut bytes = vec![];
         bytes.extend(self.addr.octets());
         bytes.extend(self.port.to_bytes());
         bytes

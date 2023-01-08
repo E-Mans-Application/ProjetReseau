@@ -14,10 +14,10 @@ pub(crate) fn now() -> DateTime {
     SystemTime::now()
 }
 
-pub(crate) fn secs_since(instant: DateTime) -> u64 {
+pub(crate) fn millis_since(instant: DateTime) -> u128 {
     let date_now = now();
     let duration = date_now
         .duration_since(instant)
         .unwrap_or(Duration::default());
-    duration.as_secs()
+    duration.as_millis()
 }

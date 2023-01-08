@@ -1,13 +1,15 @@
-extern crate derive_more;
-
 use crate::addresses::Addr;
-use crate::error::{ParseError, SerializationError, SerializationResult};
+use crate::error::{ParseError, ParseResult, SerializationError, SerializationResult};
 use crate::parse::{self, BytesStreamReader};
+use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::fmt::Display;
 
 pub(crate) const PROTOCOL_MAGIC: u8 = 95;
 pub(crate) const PROTOCOL_VERSION: u8 = 0;
+pub(crate) const MAX_SDU_SIZE: usize = 1024;
+
+pub(crate) static EMPTY_BYTE_VEC: Vec<u8> = vec![];
 
 /* #region PeerID */
 
@@ -20,22 +22,26 @@ impl PeerID {
     }
 
     fn from_bytes(recv: &[u8]) -> Option<PeerID> {
-        if recv.len() != 8 {
+        if recv.len() != PeerID::LENGTH_IN_BYTES {
             return None;
         }
 
         let mut val: u64 = 0;
         for i in 0..8 {
-            val << 8;
+            val <<= 8;
             val |= recv[i] as u64;
         }
         Some(PeerID(val))
     }
 }
 
+impl ConstantByteLength for PeerID {
+    const LENGTH_IN_BYTES: usize = 8;
+}
+
 impl ToBytes for PeerID {
     fn to_bytes(&self) -> Vec<u8> {
-        let bytes = vec![];
+        let mut bytes = vec![];
         for i in 0..8 {
             bytes.push(((self.0 >> (8 * i)) & 0xff) as u8); // cannot overflow
         }
@@ -50,12 +56,82 @@ impl ToBytes for PeerID {
 
 pub(crate) type MessageId = (PeerID, [u8; 4]);
 
+impl ConstantByteLength for MessageId {
+    const LENGTH_IN_BYTES: usize = PeerID::LENGTH_IN_BYTES + 4;
+}
+
 impl ToBytes for MessageId {
     fn to_bytes(&self) -> Vec<u8> {
-        let bytes = vec![];
+        let mut bytes = vec![];
         bytes.extend(self.0.to_bytes());
         bytes.extend(self.1);
         bytes
+    }
+}
+
+/* #endregion */
+
+/* #region LimitedString */
+
+/// A wrapper for a String whose byte
+/// representation must take at most S bytes.
+/// If S is equal to 0, the type will not be constructible
+/// because even the empty string needs at least one byte.
+#[derive(Debug)]
+pub(crate) struct LimitedString<const S: usize>(String, Vec<u8>);
+
+impl<const S: usize> TryFrom<String> for LimitedString<S> {
+    type Error = SerializationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let bytes = value.as_bytes();
+        if bytes.len() > S {
+            Err(SerializationError::StringTooLarge(value))
+        } else {
+            let bytes = bytes.to_vec();
+            Ok(LimitedString(value, bytes))
+        }
+    }
+}
+
+impl<const S: usize> TryFrom<Vec<u8>> for LimitedString<S> {
+    type Error = ParseError;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        if value.len() > S {
+            Err(ParseError::ProtocolViolation)
+        } else {
+            let str = std::str::from_utf8(&value).map_err(|_| ParseError::InvalidUtf8String)?;
+            Ok(LimitedString(str.to_owned(), value))
+        }
+    }
+}
+
+impl<const S: usize> TryFrom<&[u8]> for LimitedString<S> {
+    type Error = ParseError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Self::try_from(value.to_vec())
+    }
+}
+
+impl<const S: usize> ToBytes for LimitedString<S> {
+    fn to_bytes(&self) -> Vec<u8> {
+        self.1.clone()
+    }
+}
+
+impl<const S: usize> LimitedString<S> {
+    /// Forces wrapping the String value in a LimitedString.
+    ///
+    /// Because this method may panic, its use is discouraged except
+    /// with String literals whose size in bytes is known to be compatible.
+    ///
+    /// Instead, prefer to use try_from and use pattern matching on the result.
+    /// # Panics
+    /// Panics if the string does not fit in the LimitedString.
+    pub(crate) fn force_from_string(value: String) -> LimitedString<S> {
+        LimitedString::try_from(value).unwrap()
     }
 }
 
@@ -65,8 +141,9 @@ impl ToBytes for MessageId {
 
 /// A wrapper for a vector of bytes that guarantees that
 /// the bytes fits in a TLV.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Data(Vec<u8>);
+
 impl Data {
     const MAX_DATA_LENGTH: usize = 235; // 255 (max tlv value size) - 20 (message id size)
 
@@ -77,10 +154,10 @@ impl Data {
 
 impl Display for Data {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        String::from_utf8(self.0).map_or_else(
-            |_| f.write_fmt(format_args!("{:?}", self.0)),
-            |str| str.fmt(f),
-        )
+        match std::str::from_utf8(&self.0) {
+            Ok(str) => str.fmt(f),
+            Err(_) => f.write_fmt(format_args!("{:?}", self.0)),
+        }
     }
 }
 
@@ -140,6 +217,15 @@ impl GoAwayReason {
     }
 }
 
+impl ConstantByteLength for GoAwayReason {
+    const LENGTH_IN_BYTES: usize = 1;
+}
+impl ToBytes for GoAwayReason {
+    fn to_bytes(&self) -> Vec<u8> {
+        vec![self.to_code()]
+    }
+}
+
 /* #endregion */
 
 /* #region TagLengthValue */
@@ -152,12 +238,20 @@ pub(crate) enum TagLengthValue {
     Neighbour(Addr),
     Data(MessageId, Data),
     Ack(MessageId),
-    GoAway(GoAwayReason, String),
-    Warning(String),
+    GoAway(GoAwayReason, Option<ParseResult<LimitedString<254>>>),
+    Warning(LimitedString<255>),
+    /// A special value for received TLVs that have not been recognized.
+    /// Contains the raw tag id and the raw value of the TLV.
+    /// This TLV cannot be sent.
     Unrecognized(u8, Vec<u8>),
+    /// A special value for received TLVs that were recognized and
+    /// well-formed, but
+    Illegal(u8, ParseError),
 }
 
 impl TagLengthValue {
+    const HEADER_SIZE: usize = 2;
+
     const TAG_ID_PAD1: u8 = 0;
     const TAG_ID_PADN: u8 = 1;
     const TAG_ID_HELLO: u8 = 2;
@@ -167,6 +261,12 @@ impl TagLengthValue {
     const TAG_ID_GO_AWAY: u8 = 6;
     const TAG_ID_WARNING: u8 = 7;
 
+    /// Try to parse a TLV from the buffer, consuming all the bytes
+    /// constituting the TLV.
+    /// Only one byte is consumed if the first byte is PAD1.
+    /// Otherwise, the second byte is consumed and assumed to be the length of the TLV;
+    /// then 'length' more bytes are consumed in any case, even if the TLV is unrecognized
+    /// or ill-formed.
     pub(crate) fn try_parse(buffer: &mut parse::Buffer) -> Option<TagLengthValue> {
         let tag = buffer.next()?;
         if tag == TagLengthValue::TAG_ID_PAD1 {
@@ -176,13 +276,10 @@ impl TagLengthValue {
         let length: usize = buffer.next()?.into();
         // Allows read_to_end to consume only the current TLV
         // Also allows to check that the specified TLV length is correct
-        let buffer = buffer.extract(length)?;
+        let mut buffer = buffer.extract(length)?;
 
         match tag {
-            TagLengthValue::TAG_ID_PADN => {
-                buffer.try_take(length)?; // Check the specified length is correct
-                Some(TagLengthValue::PadN(length))
-            }
+            TagLengthValue::TAG_ID_PADN => Some(TagLengthValue::PadN(length)),
             TagLengthValue::TAG_ID_HELLO => {
                 if length != 8 && length != 16 {
                     return None;
@@ -192,7 +289,7 @@ impl TagLengthValue {
                 let receiver = buffer.try_take(8);
 
                 let sender_id = PeerID::from_bytes(sender)?;
-                let receiver_id = PeerID::from_bytes(receiver.unwrap_or_else(|| &vec![]));
+                let receiver_id = PeerID::from_bytes(receiver.unwrap_or_else(|| &EMPTY_BYTE_VEC));
 
                 Some(TagLengthValue::Hello(sender_id, receiver_id))
             }
@@ -206,7 +303,7 @@ impl TagLengthValue {
                 let sender = PeerID::from_bytes(sender)?;
 
                 let msg_id_bytes = buffer.try_take(4)?;
-                let msg_id: [u8; 4] = [0; 4];
+                let mut msg_id: [u8; 4] = [0; 4];
                 msg_id.clone_from_slice(msg_id_bytes);
 
                 if tag == TagLengthValue::TAG_ID_DATA {
@@ -224,12 +321,19 @@ impl TagLengthValue {
                 let code = buffer.next()?;
                 let reason = GoAwayReason::from_code(code);
 
-                let msg = buffer.read_to_end().to_utf8();
+                let msg = if buffer.has_next() {
+                    Some(LimitedString::try_from(buffer.read_to_end()))
+                } else {
+                    None
+                };
                 Some(TagLengthValue::GoAway(reason, msg))
             }
             TagLengthValue::TAG_ID_WARNING => {
-                let msg = buffer.read_to_end().to_utf8();
-                Some(TagLengthValue::Warning(msg))
+                let msg = LimitedString::try_from(buffer.read_to_end());
+                msg.map_or_else(
+                    |err| Some(TagLengthValue::Illegal(tag, err)),
+                    |str| Some(TagLengthValue::Warning(str)),
+                )
             }
             id => {
                 let data = buffer.read_to_end();
@@ -239,25 +343,51 @@ impl TagLengthValue {
     }
 
     fn data_header(&self, tag: u8, msg_id: &MessageId, data_len: usize) -> Vec<u8> {
-        let bytes = vec![tag];
+        let mut bytes = vec![tag];
         bytes.push((10 + data_len) as u8); // cannot overflow because data_len <= Data::MAX_DATA_LENGTH
         bytes.extend(msg_id.to_bytes());
         bytes
     }
+
+    /// Returns the total number of bytes required to serialize this TLV (including the header),
+    /// without computing the actual serialization yet.
+    fn byte_len(&self) -> usize {
+        match self {
+            TagLengthValue::Pad1 => 1,
+            TagLengthValue::PadN(size) => TagLengthValue::HEADER_SIZE + size,
+            TagLengthValue::Hello(_, Some(_)) => {
+                TagLengthValue::HEADER_SIZE + 2 * PeerID::LENGTH_IN_BYTES
+            }
+            TagLengthValue::Hello(_, _) => TagLengthValue::HEADER_SIZE + PeerID::LENGTH_IN_BYTES,
+            TagLengthValue::Neighbour(_) => TagLengthValue::HEADER_SIZE + Addr::LENGTH_IN_BYTES,
+            TagLengthValue::Data(_, data) => {
+                TagLengthValue::HEADER_SIZE + MessageId::LENGTH_IN_BYTES + data.len()
+            }
+            TagLengthValue::Ack(_) => TagLengthValue::HEADER_SIZE + MessageId::LENGTH_IN_BYTES,
+            TagLengthValue::GoAway(_, Some(Ok(msg))) => {
+                TagLengthValue::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES + msg.to_bytes().len()
+            }
+            TagLengthValue::GoAway(_, _) => {
+                TagLengthValue::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES
+            }
+            TagLengthValue::Warning(msg) => TagLengthValue::HEADER_SIZE + msg.to_bytes().len(),
+            _ => 0,
+        }
+    }
 }
 
-impl<'arena> TryToBytes<'arena> for TagLengthValue {
-    fn try_to_bytes(&'arena self) -> SerializationResult<'arena, Vec<u8>> {
+impl TryToBytes for TagLengthValue {
+    fn try_to_bytes(&self) -> SerializationResult<Vec<u8>> {
         match self {
             TagLengthValue::Pad1 => Ok(vec![TagLengthValue::TAG_ID_PAD1]),
             TagLengthValue::PadN(size) => {
-                let bytes = vec![TagLengthValue::TAG_ID_PADN, *size as u8]; // overflow ignored
+                let mut bytes = vec![TagLengthValue::TAG_ID_PADN, *size as u8]; // overflow ignored
                 bytes.extend(std::iter::repeat(0).take(*size));
                 Ok(bytes)
             }
             TagLengthValue::Hello(sender, receiver) => {
                 let size: usize = if receiver.is_some() { 16 } else { 8 };
-                let bytes = vec![TagLengthValue::TAG_ID_HELLO, size as u8]; // cannot overflow
+                let mut bytes = vec![TagLengthValue::TAG_ID_HELLO, size as u8]; // cannot overflow
                 bytes.extend(sender.to_bytes());
                 match receiver {
                     Some(id) => bytes.extend(id.to_bytes()),
@@ -266,7 +396,7 @@ impl<'arena> TryToBytes<'arena> for TagLengthValue {
                 Ok(bytes)
             }
             TagLengthValue::Neighbour(addr) => {
-                let bytes = vec![
+                let mut bytes = vec![
                     TagLengthValue::TAG_ID_NEIGHBOUR,
                     Addr::LENGTH_IN_BYTES as u8, // cannot overflow
                 ];
@@ -274,7 +404,7 @@ impl<'arena> TryToBytes<'arena> for TagLengthValue {
                 Ok(bytes)
             }
             TagLengthValue::Data(msg_id, data) => {
-                let bytes = self.data_header(TagLengthValue::TAG_ID_DATA, msg_id, data.len());
+                let mut bytes = self.data_header(TagLengthValue::TAG_ID_DATA, msg_id, data.len());
                 bytes.extend(data.to_bytes());
                 Ok(bytes)
             }
@@ -282,13 +412,12 @@ impl<'arena> TryToBytes<'arena> for TagLengthValue {
                 Ok(self.data_header(TagLengthValue::TAG_ID_ACK, msg_id, 0))
             }
             TagLengthValue::GoAway(reason, msg) => {
-                let msg_bytes = msg.as_bytes();
-                if msg_bytes.len() > 254 {
-                    // 255 (max TLV length) - 1 (code)
-                    return Err(SerializationError::TagValueTooLarge(self));
-                }
+                let msg_bytes = match msg {
+                    Some(msg) => msg.as_ref().map_or_else(|_| vec![], |msg| msg.to_bytes()),
+                    None => vec![],
+                };
 
-                let bytes = vec![
+                let mut bytes = vec![
                     TagLengthValue::TAG_ID_GO_AWAY,
                     // cannot overflow
                     (msg_bytes.len() + 1) as u8,
@@ -298,12 +427,9 @@ impl<'arena> TryToBytes<'arena> for TagLengthValue {
                 Ok(bytes)
             }
             TagLengthValue::Warning(msg) => {
-                let msg_bytes = msg.as_bytes();
-                if msg_bytes.len() > 255 {
-                    return Err(SerializationError::TagValueTooLarge(self));
-                }
+                let msg_bytes = msg.to_bytes();
 
-                let bytes = vec![
+                let mut bytes = vec![
                     TagLengthValue::TAG_ID_WARNING,
                     // cannot overflow
                     msg_bytes.len() as u8,
@@ -311,26 +437,23 @@ impl<'arena> TryToBytes<'arena> for TagLengthValue {
                 bytes.extend(msg_bytes);
                 Ok(bytes)
             }
-            _ => Err(SerializationError::UnsupportedTag(self)),
+            _ => Err(SerializationError::UnsupportedTag),
         }
     }
 }
 
 /* #endregion */
 
-/* #region Message */
+/* #region ServiceDataUnit */
 
-/// The type of a received message (the Addr element is the address of
-/// the peer that sent the message), or of a message to be sent (the Addr element is
-/// the address to the peer that should receive the message).
-pub(crate) type Message = (Addr, Vec<TagLengthValue>);
+pub(crate) type ServiceDataUnit = Vec<TagLengthValue>;
 
-impl<'arena> TryToBytes<'arena> for Message {
-    fn try_to_bytes(&'arena self) -> SerializationResult<'arena, Vec<u8>> {
-        let bytes = vec![PROTOCOL_MAGIC, PROTOCOL_VERSION];
+impl TryToBytes for ServiceDataUnit {
+    fn try_to_bytes(&self) -> SerializationResult<Vec<u8>> {
+        let mut bytes = vec![PROTOCOL_MAGIC, PROTOCOL_VERSION];
 
-        let body = vec![];
-        for tlv in self.1 {
+        let mut body = vec![];
+        for tlv in self.iter() {
             body.extend(tlv.try_to_bytes()?);
         }
         if body.len() > 255 {
@@ -341,6 +464,45 @@ impl<'arena> TryToBytes<'arena> for Message {
         bytes.extend(body);
 
         Ok(bytes)
+    }
+}
+
+/// A factory to split multiple TagLengthValues into multiple service data units.
+pub(crate) struct ServiceDataUnitFactory(VecDeque<TagLengthValue>);
+
+impl ServiceDataUnitFactory {
+    /// Creates a new ServiceDataUnitFactory from the specified queue.
+    pub(crate) fn new(queue: VecDeque<TagLengthValue>) -> ServiceDataUnitFactory {
+        ServiceDataUnitFactory(queue)
+    }
+
+    /// Consumes as much TLVs as possible from the queue,
+    /// until the queue is empty or the next TLVs no longer
+    /// fit into a single datagram.
+    /// The initial order of the TLVs is kept.
+    /// Returns a list of TLVs that can be sent in a single datagram.
+    /// If the queue is already empty, an empty vector is returned.
+    pub(crate) fn next_message(&mut self) -> ServiceDataUnit {
+        let mut size = 4;
+        let mut sdus = vec![];
+
+        loop {
+            let tlv = self.0.pop_front();
+            match tlv {
+                None => break,
+                Some(tlv) => {
+                    let tlv_len = tlv.byte_len();
+                    if size + tlv_len <= MAX_SDU_SIZE {
+                        sdus.push(tlv);
+                        size += tlv_len;
+                    } else {
+                        self.0.push_front(tlv);
+                        break;
+                    }
+                }
+            }
+        }
+        sdus
     }
 }
 
@@ -357,26 +519,24 @@ impl BytesConcat<u16> for (u8, u8) {
     }
 }
 
+pub(crate) trait ConstantByteLength: ToBytes {
+    const LENGTH_IN_BYTES: usize;
+}
+
 pub(crate) trait ToBytes {
     fn to_bytes(&self) -> Vec<u8>;
 }
-pub(crate) trait TryToBytes<'arena> {
-    fn try_to_bytes(&'arena self) -> SerializationResult<'arena, Vec<u8>>;
+pub(crate) trait TryToBytes {
+    fn try_to_bytes(&self) -> SerializationResult<Vec<u8>>;
+}
+
+impl ConstantByteLength for u16 {
+    const LENGTH_IN_BYTES: usize = 2;
 }
 
 impl ToBytes for u16 {
     fn to_bytes(&self) -> Vec<u8> {
         vec![(self >> 8) as u8, (self & 0xff) as u8] // cannot overflow
-    }
-}
-
-trait BytesToUtf8 {
-    fn to_utf8(self) -> String;
-}
-
-impl BytesToUtf8 for &[u8] {
-    fn to_utf8(self) -> String {
-        String::from_utf8(self.to_vec()).unwrap_or("".to_owned())
     }
 }
 

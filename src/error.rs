@@ -1,7 +1,6 @@
 extern crate derive_more;
 
 use self::derive_more::{Display, From};
-use crate::util::TagLengthValue;
 use std::error::Error;
 
 #[derive(From, Display, Debug)]
@@ -12,8 +11,12 @@ pub(crate) enum ParseError {
     NotAMircDatagram,
     #[display(fmt = "Received MIRC message uses an unsupported protocol version")]
     UnsupportedProtocolVersion,
+    #[display(fmt = "Invalid UTF-8 string")]
+    InvalidUtf8String,
     #[display(fmt = "Protocol violation")] // should be more verbose
     ProtocolViolation,
+    /// Sender not previously registered as a potential neighbour.
+    UnknownSender,
 }
 
 impl Error for ParseError {
@@ -26,25 +29,23 @@ impl Error for ParseError {
 }
 
 #[derive(Display, Debug)]
-pub(crate) enum SerializationError<'arena> {
-    #[display(fmt = "Unsupported tag: {_0:?}")]
-    UnsupportedTag(&'arena TagLengthValue),
-    #[display(fmt = "Tag value too large: {_0:?}")]
-    TagValueTooLarge(&'arena TagLengthValue),
+pub(crate) enum SerializationError {
+    UnsupportedTag,
     MessageBodyTooLarge,
+    StringTooLarge(String),
     Unspecified,
 }
 
-impl<'arena> Error for SerializationError<'arena> {}
+impl Error for SerializationError {}
 
 #[derive(From, Display, Debug)]
-pub(crate) enum MessageDeliveryError<'arena> {
-    SerializationFailed(SerializationError<'arena>),
+pub(crate) enum MessageDeliveryError {
+    SerializationFailed(SerializationError),
     DeliveryFailed(std::io::Error),
 }
 
-impl<'arena> Error for MessageDeliveryError<'arena> {}
+impl Error for MessageDeliveryError {}
 
 pub(crate) type ParseResult<R> = std::result::Result<R, ParseError>;
-pub(crate) type SerializationResult<'arena, R> = std::result::Result<R, SerializationError<'arena>>;
-pub(crate) type DeliveryResult<'arena, R> = std::result::Result<R, MessageDeliveryError<'arena>>;
+pub(crate) type SerializationResult<R> = std::result::Result<R, SerializationError>;
+pub(crate) type DeliveryResult<R> = std::result::Result<R, MessageDeliveryError>;

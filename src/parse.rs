@@ -1,6 +1,6 @@
 use crate::addresses::Addr;
 use crate::error::{ParseError, ParseResult};
-use crate::util::{self, BytesConcat, Message, TagLengthValue};
+use crate::util::{self, BytesConcat, ServiceDataUnit, TagLengthValue};
 use std::net::UdpSocket;
 
 /// A generic buffered bytes stream reader used for parsing
@@ -53,17 +53,18 @@ impl<'arena> BytesStreamReader<'arena> for (&'arena [u8], usize) {
     }
 
     fn try_take(&mut self, count: usize) -> Option<&'arena [u8]> {
-        let (_, slice) = self.0.split_at(self.1);
+        let slice = &self.0[self.1..];
         if count > slice.len() {
             return None;
         }
-        let (slice, _) = slice.split_at(count);
+        let slice = &slice[0..count];
         self.1 += count;
         Some(slice)
     }
 
     fn read_to_end(&mut self) -> &'arena [u8] {
-        self.try_take(self.0.len() - self.1).unwrap_or(&vec![])
+        self.try_take(self.0.len() - self.1)
+            .unwrap_or(&util::EMPTY_BYTE_VEC)
     }
 
     fn extract(&mut self, count: usize) -> Option<Self::SubBuffer> {
@@ -74,18 +75,18 @@ impl<'arena> BytesStreamReader<'arena> for (&'arena [u8], usize) {
 
 /// The base implementation of BytesStreamReader, initialized with
 /// the full byte array.
-pub(crate) struct Buffer {
-    wrapped: [u8; 1024],
+pub(crate) struct Buffer<'arena> {
+    wrapped: &'arena [u8; 1024],
     len: usize,
     pos: usize,
 }
 
-impl<'arena> Buffer {
+impl<'arena> Buffer<'arena> {
     /// Creates a new buffer from the given datagram.
     /// len must not be greater than 1024 (the maximum length of a datagram).
     /// ### Panics
     /// This method panics if len > 1024.
-    pub(crate) fn new(wrapped: [u8; 1024], len: usize) -> Buffer {
+    pub(crate) fn new(wrapped: &'arena [u8; 1024], len: usize) -> Buffer<'arena> {
         assert!(len <= 1024);
         Buffer {
             wrapped,
@@ -106,11 +107,11 @@ impl<'arena> Buffer {
     }
 
     fn as_tuple(&self) -> (&'arena [u8], usize) {
-        (self.wrapped.split_at(self.len).0, self.pos)
+        (&self.wrapped[0..self.len], self.pos)
     }
 }
 
-impl<'arena> BytesStreamReader<'arena> for Buffer {
+impl<'arena> BytesStreamReader<'arena> for Buffer<'arena> {
     type SubBuffer = BufferSlice<'arena>;
 
     fn has_next(&self) -> bool {
@@ -134,7 +135,7 @@ impl<'arena> BytesStreamReader<'arena> for Buffer {
     }
 }
 
-struct BufferSlice<'arena> {
+pub(crate) struct BufferSlice<'arena> {
     slice: &'arena [u8],
     pos: usize,
 }
@@ -199,12 +200,12 @@ impl MessageParser {
         Some((part1, part2).concat().into())
     }
 
-    pub(crate) fn try_parse(&self, socket: &UdpSocket) -> ParseResult<Message> {
+    pub(crate) fn try_parse(&self, socket: &UdpSocket) -> ParseResult<(Addr, ServiceDataUnit)> {
         let mut buf = [0; 1024];
         let (size, addr) = socket.recv_from(&mut buf)?;
         let addr: Addr = addr.into();
 
-        let buffer = Buffer::new(buf, size);
+        let mut buffer = Buffer::new(&buf, size);
 
         self.check_magic(&mut buffer)?;
         self.check_version(&mut buffer)?;
@@ -215,7 +216,7 @@ impl MessageParser {
 
         buffer.shrink(body_length + 4);
 
-        let tags = vec![];
+        let mut tags = vec![];
 
         while buffer.has_next() {
             let tlv = TagLengthValue::try_parse(&mut buffer)
