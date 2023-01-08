@@ -1,5 +1,4 @@
 extern crate derive_more;
-
 use self::derive_more::{Display, From};
 use std::error::Error;
 
@@ -42,6 +41,7 @@ impl Error for SerializationError {}
 pub(crate) enum MessageDeliveryError {
     SerializationFailed(SerializationError),
     DeliveryFailed(std::io::Error),
+    NeighbourInactive,
 }
 
 impl Error for MessageDeliveryError {}

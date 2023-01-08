@@ -1,9 +1,11 @@
+extern crate derive_more;
+
+use self::derive_more::Display;
 use crate::addresses::Addr;
 use crate::error::{ParseError, ParseResult, SerializationError, SerializationResult};
 use crate::parse::{self, BytesStreamReader};
 use std::collections::VecDeque;
 use std::convert::TryFrom;
-use std::fmt::Display;
 
 pub(crate) const PROTOCOL_MAGIC: u8 = 95;
 pub(crate) const PROTOCOL_VERSION: u8 = 0;
@@ -54,7 +56,7 @@ impl ToBytes for PeerID {
 
 /* #region MessageId */
 
-pub(crate) type MessageId = (PeerID, [u8; 4]);
+pub(crate) type MessageId = (PeerID, u32);
 
 impl ConstantByteLength for MessageId {
     const LENGTH_IN_BYTES: usize = PeerID::LENGTH_IN_BYTES + 4;
@@ -64,7 +66,7 @@ impl ToBytes for MessageId {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec![];
         bytes.extend(self.0.to_bytes());
-        bytes.extend(self.1);
+        bytes.extend(self.1.to_le_bytes());
         bytes
     }
 }
@@ -77,7 +79,8 @@ impl ToBytes for MessageId {
 /// representation must take at most S bytes.
 /// If S is equal to 0, the type will not be constructible
 /// because even the empty string needs at least one byte.
-#[derive(Debug)]
+#[derive(Debug, Display, Clone)]
+#[display(fmt = "{_0}")]
 pub(crate) struct LimitedString<const S: usize>(String, Vec<u8>);
 
 impl<const S: usize> TryFrom<String> for LimitedString<S> {
@@ -135,52 +138,42 @@ impl<const S: usize> LimitedString<S> {
     }
 }
 
-/* #endregion */
-
-/* #region Data */
-
-/// A wrapper for a vector of bytes that guarantees that
-/// the bytes fits in a TLV.
-#[derive(Debug, Clone)]
-pub(crate) struct Data(Vec<u8>);
-
-impl Data {
-    const MAX_DATA_LENGTH: usize = 235; // 255 (max tlv value size) - 20 (message id size)
-
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
+impl<const S: usize> LimitedString<S> {
+    pub(crate) fn len_in_bytes(&self) -> usize {
+        self.1.len()
     }
-}
 
-impl Display for Data {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match std::str::from_utf8(&self.0) {
-            Ok(str) => str.fmt(f),
-            Err(_) => f.write_fmt(format_args!("{:?}", self.0)),
+    pub(crate) fn pack(value: &str) -> Vec<LimitedString<S>> {
+        let mut vec = vec![];
+        if value.is_empty() {
+            return vec;
         }
-    }
-}
 
-impl TryFrom<Vec<u8>> for Data {
-    type Error = ParseError;
+        let mut i = std::cmp::min(value.len(), S / 4); // UTF-8 chars take at most 4 bytes
+        let mut bytes = value[0..i].as_bytes().to_vec();
+        assert!(bytes.len() <= S);
 
-    /// Tries to wrap the vector of bytes in a new Data object.
-    /// # Errors
-    /// This method fails if the vector is too large to fit in a TLV.
-    fn try_from(value: Vec<u8>) -> std::result::Result<Self, Self::Error> {
-        if value.len() > Data::MAX_DATA_LENGTH {
-            Err(ParseError::ProtocolViolation)
-        } else {
-            Ok(Data(value))
+        while bytes.len() < S && i < value.len() {
+            let b = value[i..(i + 1)].as_bytes().to_vec();
+            if bytes.len() + b.len() <= S {
+                bytes.extend(b);
+                i += 1;
+            } else {
+                break;
+            }
         }
+
+        assert!(bytes.len() <= S);
+
+        vec.push(LimitedString(value[0..i].to_owned(), bytes));
+        if i < value.len() {
+            vec.extend(LimitedString::pack(&value[i..]));
+        }
+        vec
     }
 }
 
-impl ToBytes for Data {
-    fn to_bytes(&self) -> Vec<u8> {
-        self.0.clone()
-    }
-}
+pub(crate) type Data = LimitedString<235>;
 
 /* #endregion */
 
@@ -311,10 +304,10 @@ impl TagLengthValue {
                     // Check
                     let data = Data::try_from(data).ok()?;
 
-                    Some(TagLengthValue::Data((sender, msg_id), data))
+                    Some(TagLengthValue::Data((sender, msg_id.concat()), data))
                 } else {
                     // ACK
-                    Some(TagLengthValue::Ack((sender, msg_id)))
+                    Some(TagLengthValue::Ack((sender, msg_id.concat())))
                 }
             }
             TagLengthValue::TAG_ID_GO_AWAY => {
@@ -361,16 +354,16 @@ impl TagLengthValue {
             TagLengthValue::Hello(_, _) => TagLengthValue::HEADER_SIZE + PeerID::LENGTH_IN_BYTES,
             TagLengthValue::Neighbour(_) => TagLengthValue::HEADER_SIZE + Addr::LENGTH_IN_BYTES,
             TagLengthValue::Data(_, data) => {
-                TagLengthValue::HEADER_SIZE + MessageId::LENGTH_IN_BYTES + data.len()
+                TagLengthValue::HEADER_SIZE + MessageId::LENGTH_IN_BYTES + data.len_in_bytes()
             }
             TagLengthValue::Ack(_) => TagLengthValue::HEADER_SIZE + MessageId::LENGTH_IN_BYTES,
             TagLengthValue::GoAway(_, Some(Ok(msg))) => {
-                TagLengthValue::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES + msg.to_bytes().len()
+                TagLengthValue::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES + msg.len_in_bytes()
             }
             TagLengthValue::GoAway(_, _) => {
                 TagLengthValue::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES
             }
-            TagLengthValue::Warning(msg) => TagLengthValue::HEADER_SIZE + msg.to_bytes().len(),
+            TagLengthValue::Warning(msg) => TagLengthValue::HEADER_SIZE + msg.len_in_bytes(),
             _ => 0,
         }
     }
@@ -404,7 +397,8 @@ impl TryToBytes for TagLengthValue {
                 Ok(bytes)
             }
             TagLengthValue::Data(msg_id, data) => {
-                let mut bytes = self.data_header(TagLengthValue::TAG_ID_DATA, msg_id, data.len());
+                let mut bytes =
+                    self.data_header(TagLengthValue::TAG_ID_DATA, msg_id, data.len_in_bytes());
                 bytes.extend(data.to_bytes());
                 Ok(bytes)
             }
@@ -516,6 +510,14 @@ pub(crate) trait BytesConcat<R> {
 impl BytesConcat<u16> for (u8, u8) {
     fn concat(self) -> u16 {
         ((self.0 as u16) << 8) | (self.1 as u16)
+    }
+}
+impl BytesConcat<u32> for [u8; 4] {
+    fn concat(self) -> u32 {
+        ((self[0] as u32) << 24)
+            | ((self[1] as u32) << 16)
+            | ((self[2] as u32) << 8)
+            | (self[3] as u32)
     }
 }
 

@@ -1,5 +1,7 @@
+use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::net::{self, IpAddr, SocketAddr, ToSocketAddrs};
+use std::str::FromStr;
 
 use crate::util::{BytesConcat, ConstantByteLength, ToBytes};
 
@@ -65,5 +67,14 @@ impl From<SocketAddr> for Addr {
             IpAddr::V4(ip) => ip.to_ipv6_mapped(),
         };
         Addr { addr, port }
+    }
+}
+
+impl TryFrom<String> for Addr {
+    type Error = std::net::AddrParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let socket_addr = SocketAddr::from_str(&value)?;
+        Ok(Addr::from(socket_addr))
     }
 }

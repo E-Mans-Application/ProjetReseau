@@ -6,3 +6,5 @@ version = "0.1.0"
 derive_more = "0.99.0"
 rand = "0.8.5"
 bumpalo = "3.11.1"
+clap = { version = "4.0.32", features = ["derive"] }
+crossbeam = "0.8.2"
