@@ -1,21 +1,22 @@
 extern crate derive_more;
+use crate::addresses::Addr;
+
 use self::derive_more::{Display, From};
 use std::error::Error;
 
 #[derive(From, Display, Debug)]
-pub(crate) enum ParseError {
-    #[display(fmt = "Cannot receive a datagram from UDP socket: {0}", _0)]
+pub enum ParseError {
+    #[display(fmt = "Cannot receive a datagram from UDP socket: {_0}")]
     ReceiveFailed(std::io::Error),
     #[display(fmt = "Received UDP datagram is not a MIRC service data unit")]
     NotAMircDatagram,
     #[display(fmt = "Received MIRC message uses an unsupported protocol version")]
-    UnsupportedProtocolVersion,
-    #[display(fmt = "Invalid UTF-8 string")]
-    InvalidUtf8String,
-    #[display(fmt = "Protocol violation")] // should be more verbose
-    ProtocolViolation,
-    /// Sender not previously registered as a potential neighbour.
-    UnknownSender,
+    UnsupportedProtocolVersion(u8),
+    #[display(fmt = "Invalid UTF-8 string: {_0}")]
+    InvalidUtf8String(std::str::Utf8Error),
+    StringTooLarge,
+    #[display(fmt = "Protocol violation from {_0}")]
+    ProtocolViolation(Addr),
 }
 
 impl Error for ParseError {
@@ -27,88 +28,30 @@ impl Error for ParseError {
     }
 }
 
+// Actually, this error should never happen because:
+// - The program should never try to send unsupported tags (tags Unrecognized or Illegal);
+// - The program uses constant-size messages in warnings and go-away TLVs, and splits data sent
+// from the user in several TLVs if needed.
 #[derive(Display, Debug)]
-pub(crate) enum SerializationError {
+pub enum SerializationError {
     UnsupportedTag,
-    MessageBodyTooLarge,
     StringTooLarge(String),
-    Unspecified,
 }
 
 impl Error for SerializationError {}
 
 #[derive(From, Display, Debug)]
-pub(crate) enum MessageDeliveryError {
-    SerializationFailed(SerializationError),
-    DeliveryFailed(std::io::Error),
-    NeighbourInactive,
+pub struct NeighbourInactive;
+
+impl Error for NeighbourInactive {}
+
+#[derive(From, Debug)]
+pub enum UseClientError {
+    PanicError(Box<dyn std::any::Any + Send + 'static>),
+    IOError(std::io::Error),
+    RustylineError(rustyline::error::ReadlineError),
 }
 
-impl Error for MessageDeliveryError {}
-
-#[derive(Display, Debug)]
-pub(crate) enum AggregateError<E: Error> {
-    #[display(fmt = "Errors aggregated during iterative operation:")]
-    NoMoreError,
-    #[display(fmt = "{_0}\n\n{_1}")]
-    Aggregate(Box<AggregateError<E>>, E),
-}
-
-impl<E: Error> Error for AggregateError<E> {}
-
-impl<E: Error> From<E> for AggregateError<E> {
-    fn from(value: E) -> Self {
-        AggregateError::Aggregate(Box::new(AggregateError::NoMoreError), value)
-    }
-}
-
-impl<E: Error> AggregateError<E> {
-    pub(crate) fn aggregate(self, other: E) -> AggregateError<E> {
-        AggregateError::Aggregate(Box::new(self), other)
-    }
-    pub(crate) fn aggregate_result<_T>(self, other: Result<_T, E>) -> AggregateError<E> {
-        match other {
-            Ok(_) => self,
-            Err(err) => self.aggregate(err),
-        }
-    }
-
-    pub(crate) fn aggregate_flatten(self, other: AggregateError<E>) -> AggregateError<E> {
-        match other {
-            Self::NoMoreError => self,
-            Self::Aggregate(head, tail) => {
-                let new_head = self.aggregate_flatten(*head);
-                Self::Aggregate(Box::new(new_head), tail)
-            }
-        }
-    }
-
-    pub(crate) fn aggregate_result_flatten(
-        self,
-        other: AggregateResult<(), E>,
-    ) -> AggregateError<E> {
-        match self {
-            Self::NoMoreError => return other.err().unwrap_or(Self::NoMoreError),
-            _ => (),
-        }
-
-        match other {
-            Ok(()) | Err(Self::NoMoreError) => self,
-            Err(err) => self.aggregate_flatten(err),
-        }
-    }
-}
-
-impl<E: Error> Into<AggregateResult<(), E>> for AggregateError<E> {
-    fn into(self) -> AggregateResult<(), E> {
-        match self {
-            Self::NoMoreError => Ok(()),
-            _ => Err(self),
-        }
-    }
-}
-
-pub(crate) type ParseResult<R> = std::result::Result<R, ParseError>;
-pub(crate) type SerializationResult<R> = std::result::Result<R, SerializationError>;
-pub(crate) type DeliveryResult<R> = std::result::Result<R, MessageDeliveryError>;
-pub(crate) type AggregateResult<R, E: Error> = std::result::Result<R, AggregateError<E>>;
+pub type ParseResult<R> = std::result::Result<R, ParseError>;
+pub type SerializationResult<R> = std::result::Result<R, SerializationError>;
+pub type InactivityResult<R> = std::result::Result<R, NeighbourInactive>;

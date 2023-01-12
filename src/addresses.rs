@@ -1,19 +1,26 @@
 use std::convert::TryFrom;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::net::{self, IpAddr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 
-use crate::util::{BytesConcat, ConstantByteLength, ToBytes};
+use crate::parse::Buffer;
 
-#[derive(PartialEq, Eq, Clone, Hash, Debug)]
-pub(crate) struct Addr {
+#[derive(PartialEq, Eq, Hash, Debug, Clone)]
+pub struct Addr {
     addr: net::Ipv6Addr,
     port: u16,
 }
 
 impl std::fmt::Display for Addr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.to_socket_addrs().fmt(f)
+        Display::fmt(
+            &self
+                .to_socket_addrs()
+                .map_err(|_err| std::fmt::Error)?
+                .next()
+                .ok_or(std::fmt::Error)?,
+            f,
+        )
     }
 }
 
@@ -21,39 +28,26 @@ impl net::ToSocketAddrs for Addr {
     type Iter = std::option::IntoIter<net::SocketAddr>;
 
     fn to_socket_addrs(&self) -> std::io::Result<Self::Iter> {
-        return (self.addr, self.port).to_socket_addrs();
+        (self.addr, self.port).to_socket_addrs()
     }
 }
 
 impl Addr {
-    pub(crate) const LENGTH_IN_BYTES: usize = 18; // 16 (IPv6) + 2 (port)
+    pub const LENGTH_IN_BYTES: usize = 18; // 16 (IPv6) + 2 (port)
 
-    pub(crate) fn from_bytes(recv: &[u8]) -> Option<Addr> {
-        if recv.len() != Addr::LENGTH_IN_BYTES {
-            return None;
-        }
+    pub fn try_parse(buf: &mut Buffer) -> Option<Addr> {
+        let addr = buf.next_u128()?;
+        let addr = net::Ipv6Addr::from(addr);
 
-        let (addr, port) = recv.split_at(16);
-
-        let mut addr_bytes = [0u8; 16];
-        addr_bytes.clone_from_slice(addr);
-
-        let addr = net::Ipv6Addr::from(addr_bytes);
-        let port = (port[0], port[1]).concat();
+        let port = buf.next_u16()?;
 
         Some(Addr { addr, port })
     }
-}
 
-impl ConstantByteLength for Addr {
-    const LENGTH_IN_BYTES: usize = 18;
-}
-
-impl ToBytes for Addr {
-    fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec![];
         bytes.extend(self.addr.octets());
-        bytes.extend(self.port.to_bytes());
+        bytes.extend(self.port.to_be_bytes());
         bytes
     }
 }
@@ -70,11 +64,20 @@ impl From<SocketAddr> for Addr {
     }
 }
 
-impl TryFrom<String> for Addr {
+impl TryFrom<&str> for Addr {
     type Error = std::net::AddrParseError;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        let socket_addr = SocketAddr::from_str(&value)?;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let socket_addr = SocketAddr::from_str(value)?;
+        Ok(Addr::from(socket_addr))
+    }
+}
+
+impl TryFrom<(&str, u16)> for Addr {
+    type Error = std::net::AddrParseError;
+
+    fn try_from(value: (&str, u16)) -> Result<Self, Self::Error> {
+        let socket_addr = SocketAddr::new(IpAddr::from_str(value.0)?, value.1);
         Ok(Addr::from(socket_addr))
     }
 }
