@@ -1,11 +1,11 @@
 extern crate derive_more;
-use crate::addresses::Addr;
+use super::addresses::Addr;
 
 use self::derive_more::{Display, From};
 use std::error::Error;
 
-#[derive(From, Display, Debug)]
-pub enum ParseError {
+#[derive(Display, Debug)]
+pub(super) enum ParseError {
     #[display(fmt = "Cannot receive a datagram from UDP socket: {_0}")]
     ReceiveFailed(std::io::Error),
     #[display(fmt = "Received UDP datagram is not a MIRC service data unit")]
@@ -17,6 +17,14 @@ pub enum ParseError {
     StringTooLarge,
     #[display(fmt = "Protocol violation from {_0}")]
     ProtocolViolation(Addr),
+    #[display(fmt = "Message received from uninvited third party: {_0} (Message ignored according to security rules.)")]
+    UnknownSender(Addr),
+}
+
+impl From<std::io::Error> for ParseError {
+    fn from(value: std::io::Error) -> Self {
+        Self::ReceiveFailed(value)
+    }
 }
 
 impl Error for ParseError {
@@ -33,7 +41,7 @@ impl Error for ParseError {
 // - The program uses constant-size messages in warnings and go-away TLVs, and splits data sent
 // from the user in several TLVs if needed.
 #[derive(Display, Debug)]
-pub enum SerializationError {
+pub(super) enum SerializationError {
     UnsupportedTag,
     StringTooLarge(String),
 }
@@ -41,7 +49,7 @@ pub enum SerializationError {
 impl Error for SerializationError {}
 
 #[derive(From, Display, Debug)]
-pub struct NeighbourInactive;
+pub(super) struct NeighbourInactive;
 
 impl Error for NeighbourInactive {}
 
@@ -49,9 +57,9 @@ impl Error for NeighbourInactive {}
 pub enum UseClientError {
     PanicError(Box<dyn std::any::Any + Send + 'static>),
     IOError(std::io::Error),
-    RustylineError(rustyline::error::ReadlineError),
+    InvalidNeighbourAddress,
 }
 
-pub type ParseResult<R> = std::result::Result<R, ParseError>;
-pub type SerializationResult<R> = std::result::Result<R, SerializationError>;
-pub type InactivityResult<R> = std::result::Result<R, NeighbourInactive>;
+pub(super) type ParseResult<R> = std::result::Result<R, ParseError>;
+pub(super) type SerializationResult<R> = std::result::Result<R, SerializationError>;
+pub(super) type InactivityResult<R> = std::result::Result<R, NeighbourInactive>;

@@ -3,14 +3,13 @@ extern crate rand;
 
 use self::rand::RngCore;
 
-use self::derive_more::{Display, From};
-use crate::addresses::Addr;
-use crate::error::{ParseError, ParseResult, SerializationError, SerializationResult};
-use crate::{datetime, parse};
+use self::derive_more::Display;
+use super::addresses::Addr;
+use super::error::{ParseError, ParseResult, SerializationError, SerializationResult};
+use super::parse;
 use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::rc::Rc;
-use std::sync::Mutex;
 
 pub const PROTOCOL_MAGIC: u8 = 95;
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -25,13 +24,13 @@ pub static EMPTY_BYTE_VEC: Vec<u8> = vec![];
 pub struct PeerID(u64);
 
 impl PeerID {
-    pub fn new<T : RngCore>(rng: &mut T) -> PeerID {
-        PeerID(rng.next_u64())
+    pub fn new<T: RngCore>(rng: &mut T) -> Self {
+        Self(rng.next_u64())
     }
 
-    fn try_parse(buffer: &mut parse::Buffer) -> Option<PeerID> {
+    fn try_parse(buffer: &mut parse::Buffer) -> Option<Self> {
         let id = buffer.next_u64()?;
-        Some(PeerID(id))
+        Some(Self(id))
     }
 
     const LENGTH_IN_BYTES: usize = 8;
@@ -56,16 +55,16 @@ impl MessageId {
         bytes.extend(self.1.to_be_bytes());
         bytes
     }
-    fn try_parse(buffer: &mut parse::Buffer) -> Option<MessageId> {
+    fn try_parse(buffer: &mut parse::Buffer) -> Option<Self> {
         let sender = PeerID::try_parse(buffer)?;
         let id = buffer.next_u32()?;
-        Some(MessageId(sender, id))
+        Some(Self(sender, id))
     }
 }
 
 impl From<(PeerID, u32)> for MessageId {
     fn from(value: (PeerID, u32)) -> Self {
-        MessageId(value.0, value.1)
+        Self(value.0, value.1)
     }
 }
 
@@ -77,7 +76,7 @@ impl From<(PeerID, u32)> for MessageId {
 /// representation must take at most S bytes.
 #[derive(Debug, Display, Clone)]
 #[display(fmt = "{_0}")]
-pub struct LimitedString<const S: usize>(String);
+pub(super) struct LimitedString<const S: usize>(String);
 
 impl<const S: usize> TryFrom<String> for LimitedString<S> {
     type Error = SerializationError;
@@ -86,7 +85,7 @@ impl<const S: usize> TryFrom<String> for LimitedString<S> {
         if value.len() > S {
             Err(SerializationError::StringTooLarge(value))
         } else {
-            Ok(LimitedString(value))
+            Ok(Self(value))
         }
     }
 }
@@ -98,7 +97,7 @@ impl<const S: usize> TryFrom<&[u8]> for LimitedString<S> {
             Err(ParseError::StringTooLarge)
         } else {
             let str = std::str::from_utf8(value).map_err(ParseError::InvalidUtf8String)?;
-            Ok(LimitedString(str.to_owned()))
+            Ok(Self(str.to_owned()))
         }
     }
 }
@@ -108,13 +107,13 @@ impl<const S: usize> LimitedString<S> {
         self.0.len()
     }
 
-    pub fn pack(value: &str) -> Vec<LimitedString<S>> {
+    pub fn pack(value: &str) -> Vec<Self> {
         assert!(S != 0);
         if value.is_empty() {
             return vec![];
         }
         if value.len() <= S {
-            return vec![LimitedString(value.to_owned())];
+            return vec![Self(value.to_owned())];
         }
 
         let mut vec = vec![];
@@ -125,7 +124,7 @@ impl<const S: usize> LimitedString<S> {
             if str.len() + c.len_utf8() <= S {
                 str.push(c);
             } else {
-                vec.push(LimitedString(str));
+                vec.push(Self(str));
                 str = String::from(c);
             }
         }
@@ -138,7 +137,7 @@ impl<const S: usize> LimitedString<S> {
     }
 }
 
-pub type Data = LimitedString<235>;
+pub(super) type Data = LimitedString<235>;
 
 /* #endregion */
 
@@ -150,6 +149,8 @@ pub enum GoAwayReason {
     EmitterLeaving,
     Inactivity,
     ProtocolViolation,
+    #[deprecated = "non-standard"]
+    Reciprocation,
 }
 
 impl GoAwayReason {
@@ -157,20 +158,22 @@ impl GoAwayReason {
     const CODE_INACTIVITY: u8 = 2;
     const CODE_PROTOCOL_VIOLATION: u8 = 3;
 
-    const fn from_code(code: u8) -> GoAwayReason {
+    const fn from_code(code: u8) -> Self {
         match code {
-            GoAwayReason::CODE_EMITTER_LEAVING => GoAwayReason::EmitterLeaving,
-            GoAwayReason::CODE_INACTIVITY => GoAwayReason::Inactivity,
-            GoAwayReason::CODE_PROTOCOL_VIOLATION => GoAwayReason::ProtocolViolation,
-            _ => GoAwayReason::Unknown,
+            Self::CODE_EMITTER_LEAVING => Self::EmitterLeaving,
+            Self::CODE_INACTIVITY => Self::Inactivity,
+            Self::CODE_PROTOCOL_VIOLATION => Self::ProtocolViolation,
+            4 => Self::Reciprocation,
+            _ => Self::Unknown,
         }
     }
     const fn to_code(&self) -> u8 {
         match self {
-            GoAwayReason::Unknown => 0,
-            GoAwayReason::EmitterLeaving => GoAwayReason::CODE_EMITTER_LEAVING,
-            GoAwayReason::Inactivity => GoAwayReason::CODE_INACTIVITY,
-            GoAwayReason::ProtocolViolation => GoAwayReason::CODE_PROTOCOL_VIOLATION,
+            Self::Unknown => 0,
+            Self::EmitterLeaving => Self::CODE_EMITTER_LEAVING,
+            Self::Inactivity => Self::CODE_INACTIVITY,
+            Self::ProtocolViolation => Self::CODE_PROTOCOL_VIOLATION,
+            Self::Reciprocation => 4,
         }
     }
 
@@ -182,7 +185,7 @@ impl GoAwayReason {
 /* #region TagLengthValue */
 
 #[derive(Debug)]
-pub enum TagLengthValue {
+pub(super) enum TagLengthValue {
     Pad1,
     PadN(usize),
     Hello(PeerID, Option<PeerID>),
@@ -225,10 +228,10 @@ impl TagLengthValue {
     /// If the parsing fails (i.e. this function returns None),
     /// the buffer is left in an unspecified state. The bytes read until the error
     /// is detected are lost.
-    pub fn try_parse(buffer: &mut parse::Buffer) -> Option<TagLengthValue> {
+    pub fn try_parse(buffer: &mut parse::Buffer) -> Option<Self> {
         let tag = buffer.next()?;
-        if tag == TagLengthValue::TAG_ID_PAD1 {
-            return Some(TagLengthValue::Pad1);
+        if tag == Self::TAG_ID_PAD1 {
+            return Some(Self::Pad1);
         }
 
         let length: usize = buffer.next()?.into();
@@ -314,24 +317,20 @@ impl TagLengthValue {
     /// functions that rely on it will have an unspecified behaviour.
     fn byte_len(&self) -> usize {
         match self {
-            TagLengthValue::Pad1 => 1,
-            TagLengthValue::PadN(size) => TagLengthValue::HEADER_SIZE + size,
-            TagLengthValue::Hello(_, Some(_)) => {
-                TagLengthValue::HEADER_SIZE + 2 * PeerID::LENGTH_IN_BYTES
+            Self::Pad1 => 1,
+            Self::PadN(size) => Self::HEADER_SIZE + size,
+            Self::Hello(_, Some(_)) => Self::HEADER_SIZE + 2 * PeerID::LENGTH_IN_BYTES,
+            Self::Hello(_, _) => Self::HEADER_SIZE + PeerID::LENGTH_IN_BYTES,
+            Self::Neighbour(_) => Self::HEADER_SIZE + Addr::LENGTH_IN_BYTES,
+            Self::Data(_, data) => {
+                Self::HEADER_SIZE + MessageId::LENGTH_IN_BYTES + data.len_in_bytes()
             }
-            TagLengthValue::Hello(_, _) => TagLengthValue::HEADER_SIZE + PeerID::LENGTH_IN_BYTES,
-            TagLengthValue::Neighbour(_) => TagLengthValue::HEADER_SIZE + Addr::LENGTH_IN_BYTES,
-            TagLengthValue::Data(_, data) => {
-                TagLengthValue::HEADER_SIZE + MessageId::LENGTH_IN_BYTES + data.len_in_bytes()
+            Self::Ack(_) => Self::HEADER_SIZE + MessageId::LENGTH_IN_BYTES,
+            Self::GoAway(_, Some(Ok(msg))) => {
+                Self::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES + msg.len_in_bytes()
             }
-            TagLengthValue::Ack(_) => TagLengthValue::HEADER_SIZE + MessageId::LENGTH_IN_BYTES,
-            TagLengthValue::GoAway(_, Some(Ok(msg))) => {
-                TagLengthValue::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES + msg.len_in_bytes()
-            }
-            TagLengthValue::GoAway(_, _) => {
-                TagLengthValue::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES
-            }
-            TagLengthValue::Warning(msg) => TagLengthValue::HEADER_SIZE + msg.len_in_bytes(),
+            Self::GoAway(_, _) => Self::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES,
+            Self::Warning(msg) => Self::HEADER_SIZE + msg.len_in_bytes(),
             _ => 0,
         }
     }
@@ -436,7 +435,7 @@ impl MessagePart {
 }
 
 /// A buffered queue-like factory to construct service data units.
-pub struct MessageFactory {
+pub(super) struct MessageFactory {
     total_bytes: usize,
     buffer: VecDeque<MessagePart>,
 }
@@ -480,7 +479,7 @@ impl MessageFactory {
     /// maximum length of a SDU. Those TLVs are removed from the queue.
     /// The returned value should be sent as-is.
     /// When this method returns, there may still be TLVs in the queue.
-    pub fn build_next(&mut self) -> Vec<u8> {
+    pub fn build_next(&mut self) -> Option<Vec<u8>> {
         let mut vec = vec![PROTOCOL_MAGIC, PROTOCOL_VERSION, 0u8, 0u8];
 
         while let Some(part) = self.buffer.pop_front() {
@@ -493,275 +492,16 @@ impl MessageFactory {
                 break;
             }
         }
+        if vec.len() == 4 {
+            return None;
+        }
 
         let size = (vec.len() as u16 - 4).to_be_bytes();
         vec[2] = size[0];
         vec[3] = size[1];
 
-        vec
+        Some(vec)
     }
 }
-
-/* #endregion */
-
-/* #region Logging */
-
-/* #region VerboseLevel */
-
-/// This enum allows to control how verbose the program should be.
-/// This enum may not be exhaustive. The relative order between the levels
-/// is guaranteed to be stable, but new levels may be added in the future.
-/// Numeric equivalents are not stable, so it's better to use the string representation of
-/// the levels in command line arguments.
-#[derive(PartialEq, Eq, PartialOrd, Ord, From, Clone, Copy, Debug, Display, Default)]
-#[repr(u8)]
-pub enum VerboseLevel {
-    /// This level is guaranteed to be lower than that of any event.
-    /// It is also guaranteed to correspond to the numeric value 0.
-    /// It is used to disable logging of all events.
-    Disabled = 0,
-    /// Verbose level of severe (but not critical) internal errors.
-    #[display(fmt = "\x1b[1;31mInternal error\x1b[0m")]
-    InternalError,
-    /// Verbose level of non-critical events that should not have occurred
-    /// and require further investigation.
-    #[display(fmt = "\x1b[1;93mWarning\x1b[0m")]
-    Warning,
-    /// Verbose level of unexpected events that may not require special action.
-    /// Those events are likely to be the remote's fault.
-    #[display(fmt = "\x1b[1;34mAnomaly\x1b[0m")]
-    #[default]
-    Anomaly,
-    /// Verbose level of important information that may interest the user, even
-    /// when not debugging.
-    #[display(fmt = "\x1b[1mImportant\x1b[0m")]
-    Important,
-    /// Verbose level of events that are noticeable but should be silenced in
-    /// non-debug runs.
-    Information,
-    /// High verbose level corresponding to real-time logging of
-    /// the actions undertaken  by the program.
-    /// Using this level (or a higher one) will cause printing of a lot of messages.
-    Trace,
-    /// High Verbose level that enables logging of various low-level events, such
-    /// as unprocessed network events. This level also includes Trace events.
-    Debug,
-    /// This level is guaranteed to be higher than that of any event.
-    /// It is used to enable logging of all events.
-    Full,
-}
-
-impl From<VerboseLevel> for u8 {
-    fn from(value: VerboseLevel) -> Self {
-        value as u8
-    }
-}
-
-impl From<u8> for VerboseLevel {
-    fn from(mut value: u8) -> Self {
-        if value > Self::Full.into() {
-            value = Self::Full.into();
-        }
-        // # Safety: it is guaranteed that 0 <= value <= Full
-        unsafe { std::mem::transmute(value) }
-    }
-}
-
-// TODO use or remove
-
-impl VerboseLevel {
-    const VALUES: [Self; 9] = [
-        Self::Disabled,
-        Self::InternalError,
-        Self::Warning,
-        Self::Anomaly,
-        Self::Important,
-        Self::Information,
-        Self::Trace,
-        Self::Debug,
-        Self::Full,
-    ];
-    const DISABLED_STR: &str = "disabled";
-    const ERROR_STR: &str = "internal-error";
-    const WARNING_STR: &str = "warning";
-    const ANOMALY_STR: &str = "anomaly";
-    const IMPORTANT_STR: &str = "important";
-    const INFORMATION_STR: &str = "information";
-    const TRACE_STR: &str = "trace";
-    const DEBUG_STR: &str = "debug";
-    const FULL_STR: &str = "full";
-
-    const fn value_variants<'a>() -> &'a [Self] {
-        &Self::VALUES
-    }
-
-    const fn to_arg_string(self) -> &'static str {
-        match self {
-            Self::Disabled => Self::DISABLED_STR,
-            Self::InternalError => Self::ERROR_STR,
-            Self::Warning => Self::WARNING_STR,
-            Self::Anomaly => Self::ANOMALY_STR,
-            Self::Important => Self::IMPORTANT_STR,
-            Self::Information => Self::INFORMATION_STR,
-            Self::Trace => Self::TRACE_STR,
-            Self::Debug => Self::DEBUG_STR,
-            Self::Full => Self::FULL_STR,
-        }
-    }
-}
-
-impl std::str::FromStr for VerboseLevel {
-    type Err = ();
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        match input.to_lowercase().as_str() {
-            Self::DISABLED_STR | "off" => Ok(Self::Disabled),
-            Self::ERROR_STR | "error" | "err" => Ok(Self::InternalError),
-            Self::WARNING_STR | "warn" => Ok(Self::Warning),
-            Self::ANOMALY_STR => Ok(Self::Anomaly),
-            Self::IMPORTANT_STR => Ok(Self::Important),
-            Self::INFORMATION_STR | "info" => Ok(Self::Information),
-            Self::TRACE_STR => Ok(Self::Trace),
-            Self::DEBUG_STR => Ok(Self::Debug),
-            Self::FULL_STR | "all" => Ok(Self::Full),
-            _ => input.parse::<u8>().map(Self::from).map_err(|_err| ()),
-        }
-    }
-}
-
-/* #endregion */
-
-/* #region EventLog */
-
-/// A thread-safe event logger.
-/// The methods use trait `ToStringOnce` (see below), that is implemented by all
-/// `ToString` objects, and by the struct `LazyFormat` (see below)
-pub struct EventLog {
-    min_level: VerboseLevel,
-    barrier: Mutex<()>,
-}
-
-impl EventLog {
-    pub const fn new(min_level: VerboseLevel) -> EventLog {
-        EventLog {
-            min_level,
-            barrier: Mutex::new(()),
-        }
-    }
-
-    pub fn log_event<T: ToStringOnce>(&self, severity: VerboseLevel, msg: T) {
-        let _lock = self.barrier.lock().unwrap();
-        if severity <= self.min_level {
-            eprintln!(
-                "[{0}] {1}: {2}",
-                datetime::now_formatted(),
-                severity,
-                msg.to_string_once()
-            );
-        }
-    }
-
-    pub fn error<T: ToStringOnce>(&self, msg: T) {
-        self.log_event(VerboseLevel::InternalError, msg);
-    }
-    pub fn warning<T: ToStringOnce>(&self, msg: T) {
-        self.log_event(VerboseLevel::Warning, msg);
-    }
-    pub fn anomaly<T: ToStringOnce>(&self, msg: T) {
-        self.log_event(VerboseLevel::Anomaly, msg);
-    }
-    pub fn important<T: ToStringOnce>(&self, msg: T) {
-        self.log_event(VerboseLevel::Important, msg);
-    }
-    pub fn information<T: ToStringOnce>(&self, msg: T) {
-        self.log_event(VerboseLevel::Information, msg);
-    }
-    pub fn trace<T: ToStringOnce>(&self, msg: T) {
-        self.log_event(VerboseLevel::Trace, msg);
-    }
-    pub fn debug<T: ToStringOnce>(&self, msg: T) {
-        self.log_event(VerboseLevel::Debug, msg);
-    }
-}
-
-/* #endregion */
-
-/* #region Convenience macros + lazy formatting */
-
-// Lazy formatting
-// This allows to replace macro `format!` in order to not build the string if it won't actually be used
-// (Example: no string will be allocated for `Debug` messages if the verbose level is lower)
-// A crate `LazyFormat` exists, but it uses a `Fn `instead of a `FnOnce`, causing all non-copy arguments
-// to be moved.
-
-/// Objects that are consumed when converted to string.
-/// (Typical use: `FnOnce() -> String`)
-pub trait ToStringOnce {
-    fn to_string_once(self) -> String;
-}
-pub struct LazyFormat<Closure>(pub Closure)
-where
-    Closure: FnOnce() -> String;
-
-// Who can do more can do less.
-impl<T: ToString> ToStringOnce for T {
-    fn to_string_once(self) -> String {
-        self.to_string()
-    }
-}
-
-impl<Closure: FnOnce() -> String> ToStringOnce for LazyFormat<Closure> {
-    fn to_string_once(self) -> String {
-        self.0()
-    }
-}
-
-// Convenience macros to use lazy formatting more easily and to have a
-// more concise syntax.
-
-#[macro_export]
-macro_rules! lazy_format {
-    ($($args: tt)*) => {
-        $crate::util::LazyFormat(|| format!($($args)*))
-    }
-}
-
-#[macro_export]
-macro_rules! log_warning {
-    ($self: ident, $($args: tt)*) => {
-        $self.get_logger().warning(lazy_format!($($args)*));
-    }
-}
-#[macro_export]
-macro_rules! log_anomaly {
-    ($self: ident, $($args: tt)*) => {
-        $self.get_logger().anomaly(lazy_format!($($args)*));
-    }
-}
-#[macro_export]
-macro_rules! log_important {
-    ($self: ident, $($args: tt)*) => {
-        $self.get_logger().important(lazy_format!($($args)*));
-    }
-}
-#[macro_export]
-macro_rules! log_info {
-    ($self: ident, $($args: tt)*) => {
-        $self.get_logger().information(lazy_format!($($args)*));
-    }
-}
-#[macro_export]
-macro_rules! log_trace {
-    ($self: ident, $($args: tt)*) => {
-        $self.get_logger().trace(lazy_format!($($args)*));
-    }
-}
-#[macro_export]
-macro_rules! log_debug {
-    ($self: ident, $($args: tt)*) => {
-        $self.get_logger().debug(lazy_format!($($args)*));
-    }
-}
-
-/* #endregion */
 
 /* #endregion */

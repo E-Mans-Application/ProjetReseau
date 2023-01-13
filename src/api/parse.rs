@@ -1,6 +1,7 @@
-use crate::addresses::Addr;
-use crate::error::{ParseError, ParseResult};
-use crate::util::{self, EventLog, TagLengthValue};
+use super::addresses::Addr;
+use super::error::{ParseError, ParseResult};
+use super::logging::EventLog;
+use super::util::{self, TagLengthValue};
 use std::convert::TryInto;
 use std::net::UdpSocket;
 
@@ -138,7 +139,7 @@ impl<'arena> Buffer<'arena> {
 }
 
 /// Allows to parse messages received from a socket.
-pub struct MessageParser;
+pub(super) struct MessageParser;
 
 impl MessageParser {
     fn check_magic(buffer: &mut Buffer) -> ParseResult<()> {
@@ -202,8 +203,8 @@ impl MessageParser {
                 Some(tlv) => tags.push(tlv),
                 None if !tags.is_empty() => {
                     logger.warning(format!(
-                        "While processing received bytes from {0}: Parsing interrupted before the end of the message was
-                    reached due to a protocol violation. Keeping only the TLVs parsed so far.",
+                        "While processing received bytes from {0}: Parsing interrupted before the end of the message \
+                        due to a protocol violation. Keeping only the TLVs parsed so far.",
                     &addr));
                     break;
                 }
