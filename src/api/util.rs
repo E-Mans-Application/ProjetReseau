@@ -1,3 +1,6 @@
+//! This modules contains miscellaneous structures that
+//! are used by the internal API.
+
 extern crate derive_more;
 extern crate rand;
 
@@ -19,11 +22,13 @@ pub static EMPTY_BYTE_VEC: Vec<u8> = vec![];
 
 /* #region PeerID */
 
+/// The ID of a client.
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Display)]
 #[display(fmt = "{_0}")]
 pub struct PeerID(u64);
 
 impl PeerID {
+    /// Creates a new random ID using the given RngCore.
     pub fn new<T: RngCore>(rng: &mut T) -> Self {
         Self(rng.next_u64())
     }
@@ -43,6 +48,7 @@ impl PeerID {
 
 /* #region MessageId */
 
+/// The ID of a message
 #[derive(Debug, Display, PartialEq, Eq, Hash, Clone, Copy)]
 #[display(fmt = "({_0}, {_1})")]
 pub struct MessageId(PeerID, u32);
@@ -107,6 +113,12 @@ impl<const S: usize> LimitedString<S> {
         self.0.len()
     }
 
+    /// Divides a string value in multiple `LimitedString`s,
+    /// such as all `LimitedString`s contain a valid UTF-8 string,
+    /// and the concatenation of the `LimitedString`s is the
+    /// initial value.
+    ///
+    /// This function cannot be called if S = 0.
     pub fn pack(value: &str) -> Vec<Self> {
         assert!(S != 0);
         if value.is_empty() {
@@ -137,18 +149,21 @@ impl<const S: usize> LimitedString<S> {
     }
 }
 
+/// A specific alias for the data sent in the TLVs 'Data'.
 pub(super) type Data = LimitedString<235>;
 
 /* #endregion */
 
 /* #region GoAwayReason */
 
+/// Reason for a "GoAway" TLV.
 #[derive(Debug)]
 pub enum GoAwayReason {
     Unknown,
     EmitterLeaving,
     Inactivity,
     ProtocolViolation,
+    /// Reply to a GoAway
     #[deprecated = "non-standard"]
     Reciprocation,
 }
@@ -184,6 +199,7 @@ impl GoAwayReason {
 
 /* #region TagLengthValue */
 
+/// Structure that represents a TLV.
 #[derive(Debug)]
 pub(super) enum TagLengthValue {
     Pad1,
@@ -235,7 +251,7 @@ impl TagLengthValue {
         }
 
         let length: usize = buffer.next()?.into();
-        // Allows read_to_end to consume only the current TLV
+        // Allows `read_to_end` to consume only the current TLV
         // Also allows to check that the specified TLV length is correct
         let mut buffer = buffer.extract(length)?;
 
@@ -304,6 +320,7 @@ impl TagLengthValue {
     /// Returns the first part of a Data or an Ack TLV
     /// The first part is defined as: [tag, length, message id...], that is, the TLV
     /// without the data.
+    /// For the Ack TLV, this is actually the whole TLV.
     fn data_header(tag: u8, msg_id: &MessageId, data_len: usize) -> Vec<u8> {
         let mut bytes = vec![tag];
         bytes.push((12 + data_len) as u8); // cannot overflow because data_len <= 235
@@ -448,18 +465,20 @@ impl MessageFactory {
         }
     }
 
+    /// Enqueues one TLV
     pub fn enqueue_tlv(&mut self, tlv: Rc<TagLengthValue>) {
         self.total_bytes += tlv.byte_len();
         self.buffer.push_back(MessagePart::TLV(tlv));
     }
 
+    /// Enqueues multiple TLVs at once.
     pub fn enqueue_many_tlvs(&mut self, tlvs: &[Rc<TagLengthValue>]) {
         self.total_bytes += tlvs.iter().fold(0, |acc, elt| acc + elt.byte_len());
         self.buffer
             .extend(tlvs.iter().map(|t| MessagePart::TLV(Rc::clone(t))));
     }
 
-    /// Enqueue a precomputed byte representation of a single TLV.
+    /// Enqueues a precomputed byte representation of a single TLV.
     /// The bytes must correspond to a single TLV.
     /// Enqueuing multiple TLVs using this function is not supported (because it is not
     /// useful in the program) and may lead to unexpected results.

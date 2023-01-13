@@ -1,3 +1,6 @@
+//! This is the main module of the internal, private API.
+//! It organizes the different API objects to make them work together.
+
 use crossbeam::channel::Receiver;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -23,21 +26,53 @@ use crate::{lazy_format, log_anomaly, log_debug, log_important, log_info, log_tr
 
 /* #region PARAMETERS */
 
+/// Indicates whether uninvited neighbours are allowed
+/// to send messages to this client.
+/// A neighbour is said to be "invited" if it is either
+/// given as the "first neighbour" argument when the program
+/// starts, or it is invited through a "Neighbour" TLV by an
+/// invited neighbour.
+///
+/// If [`ALLOW_SELF_INVITATION`] is true, any uninvited remote
+/// that sends a message to this client will be automatically
+/// invited (i.e. added to the potential neighbour map).
+/// Otherwise, messages from uninvited clients won't be processed.
 const ALLOW_SELF_INVITATION: bool = false;
 
-const min_NS: usize = 1;
+/// Minimum expected number of symmetric neighbours.
+/// If the number of symmetric neighbours is lower,
+/// an "Hello" TLV will be sent to all the non-symmetric
+/// neighbours.
+const min_NS: usize = 1; //TODO
 
+/// Delay (in milliseconds) after which a neighbour is marked as inactive
+/// if it does not say hello. (Fixed by the subject)
 const ACTIVITY_TIMEOUT: u128 = 120_000;
+
+/// Delay (in milliseconds) after which a neighbour is marked as non-symmetric
+/// if it does not send a long hello. (Fixed by the subject)
 const SYMMETRY_TIMEOUT: u128 = 120_000;
 
+/// Number of times a "Data" TLV should be sent to a neighbour
+/// before the neighbour is considered as inactive (unless it
+/// sends acknoledgment). (Fixed by the subject)
 const MAX_FLOODING_TIMES: u8 = 5;
 
+/// Interval (in milliseconds) at which to say hello to the active neighbours.
+/// (Fixed by the subject)
 const HELLO_INTERVAL: u128 = 30_000;
-const NEIGHBOURHOOD_BROADCAST_INTERVAL: u128 = 1_000;
-const MIN_PING_INTERVAL: u128 = 1_000;
+
+/// Interval (in milliseconds) at which to send the list of symmetric neighbours
+/// to all the active neighbours.
+const NEIGHBOURHOOD_BROADCAST_INTERVAL: u128 = 30_000;
+
+/// The minimum interval (in milliseconds) between two "pings" to the potential neighbours.
+/// (A ping is the operation performed when `min_NS` is not respected.)
+const MIN_PING_INTERVAL: u128 = 30_000;
 
 /* #endregion */
 
+/// Adds a convenience method to HashMap's entries.
 trait EntryExtension {
     fn is_vacant(&self) -> bool;
 }
@@ -48,8 +83,9 @@ impl<K, V> EntryExtension for Entry<'_, K, V> {
     }
 }
 
-/* #region ActiveNeighbour */
+/* #region Neighbours */
 
+/// A structure that represents an active neighbour.
 struct ActiveNeighbour<'arena> {
     id: PeerID,
     addr: &'arena Addr,
@@ -58,6 +94,8 @@ struct ActiveNeighbour<'arena> {
 }
 
 impl<'arena> ActiveNeighbour<'arena> {
+    /// Creates a new ActiveNeighbour for the neighbour with the specified `id`
+    /// and address.
     const fn new(id: PeerID, addr: &'arena Addr) -> Self {
         let never = datetime::never();
         Self {
@@ -72,6 +110,12 @@ impl<'arena> ActiveNeighbour<'arena> {
         datetime::millis_since(self.last_long_hello) < SYMMETRY_TIMEOUT
     }
 
+    /// Sends a Hello TLV to the neighbour.
+    /// `local_id` is the ID of the local user (`ActiveNeighbour` has no copy of it),
+    /// `socket` is the socket used to send the message.
+    /// # Errors
+    /// If the neighbour has not said hello for more than [`ACTIVITY_TIMEOUT`] milliseconds,
+    /// the operation is aborted and this function returns `Err(NeighbourInactive)`.
     fn say_hello(&self, local_id: PeerID, socket: &MircHost<'arena>) -> InactivityResult<()> {
         if datetime::millis_since(self.last_hello) > ACTIVITY_TIMEOUT {
             Err(NeighbourInactive)
@@ -83,8 +127,7 @@ impl<'arena> ActiveNeighbour<'arena> {
     }
 }
 
-/* #endregion */
-
+/// A structure that stores all the neighbours (potential or active).
 struct NeighbourHood<'arena> {
     alloc: &'arena bumpalo::Bump,
     socket: &'arena MircHost<'arena>,
@@ -96,6 +139,14 @@ struct NeighbourHood<'arena> {
 }
 
 impl<'arena> NeighbourHood<'arena> {
+    /// Creates a new neighbourhood.
+    /// `alloc` is the [`bumpalo::Bump`] used for "hash consing".
+    /// `socket` is the socket used to send the messages to the neighbours. It will be
+    /// borrowed for all the life of the `NeighbourHood`.
+    /// # Note:
+    /// Using `&'arena Addr` prevents from storing copies of `Addr` (it is
+    /// immutable and value-based, but it takes 18 bytes), but it also allows
+    /// to distinguish between an invited or an uninvited neighbour.
     fn new(alloc: &'arena bumpalo::Bump, socket: &'arena MircHost<'arena>) -> Self {
         Self {
             alloc,
@@ -108,6 +159,15 @@ impl<'arena> NeighbourHood<'arena> {
         }
     }
 
+    /// Welcomes a new neighbour, and adds it to the potential neighbours map.
+    /// `addr` is the address of the neighbour.
+    /// `authorize` indicates whether the neighbour has been explictly invited (either
+    ///  by the user that started the program, or by an invited neighbour).
+    /// Returns a `Some` value containing a long-lasting reference to the address of the
+    /// neighbour if it is authorized to join the neighbourhood, and `None` otherwise.
+    /// # Note:
+    /// If [`ALLOW_SELF_INVITATION`] is true, the argument `authorized` is ignored and
+    /// this function never returns `None`.
     fn welcome(&mut self, addr: Addr, authorized: bool) -> Option<&'arena Addr> {
         if let Some(registered) = self.tvp.get(&addr) {
             Some(*registered)
@@ -120,6 +180,12 @@ impl<'arena> NeighbourHood<'arena> {
         }
     }
 
+    /// Adds a neighbour to the active neighbours map and updates the date of its
+    /// last activity (i.e. its last short hello).
+    /// An `ActiveNeighbour` object is created if the neighbour was not previously active.
+    /// # Returns
+    /// A tuple with two items. The boolean is `true` if the neighbour was not active until now.
+    /// The second element is a reference to the `ActiveNeighbour` object associated to the neighbour.
     fn mark_active(
         &mut self,
         addr: &'arena Addr,
@@ -134,6 +200,7 @@ impl<'arena> NeighbourHood<'arena> {
         (new, neighbour)
     }
 
+    /// Returns the number of symmetric neighbours in the neighbourhood.
     fn count_symmetrics(&self) -> usize {
         self.fold(
             0,
@@ -141,12 +208,18 @@ impl<'arena> NeighbourHood<'arena> {
         )
     }
 
+    /// Indicates whether a neighbour is currently symmetric.
     fn is_symmetric(&self, addr: &Addr) -> bool {
         self.tva
             .get(addr)
             .is_some_and(|n| n.borrow().is_symmetric())
     }
 
+    /// Dismisses all the neighbours contained in the array `who`.
+    /// The neighbours are removed from the active neighbour map, but are kept from
+    /// the potential neighbour map.
+    /// A "GoAway" TLV with the given `reason` and `msg` is sent to all the dismissed
+    /// neighbours.
     fn dismiss(&mut self, who: &[&'arena Addr], reason: GoAwayReason, msg: Option<String>) {
         let msg = Rc::new(TagLengthValue::GoAway(
             reason,
@@ -160,10 +233,16 @@ impl<'arena> NeighbourHood<'arena> {
         }
     }
 
+    /// Indicates whether it is timely to greet (i.e. say hello) to the
+    /// active neighbours.
     fn should_greet(&self) -> bool {
         datetime::millis_since(self.last_greetings) > HELLO_INTERVAL
     }
 
+    /// Says hello to all the active neighbours.
+    /// ### Side effect:
+    /// This functions dismisses the neighbours that have not said hello for a long time,
+    /// and sends them a "GoAway" TLV with code "Inactivity".
     fn greet_all(&mut self, id: PeerID) {
         let mut inactives = vec![];
 
@@ -181,10 +260,15 @@ impl<'arena> NeighbourHood<'arena> {
         );
     }
 
+    /// Indicates whether it is timely to broadcast the list of the symmetric neighbours
+    /// to all the active neighbours.
     fn should_broadcast(&self) -> bool {
         datetime::millis_since(self.last_broadcast) > NEIGHBOURHOOD_BROADCAST_INTERVAL
     }
 
+    /// Broadcasts the list of the symmetric neighbours
+    /// to all the active neighbours.
+    /// This function does not check for inactivity.
     fn broadcast(&mut self) {
         let mut neighbours = vec![];
         let mut msg = vec![];
@@ -199,11 +283,15 @@ impl<'arena> NeighbourHood<'arena> {
         self.last_broadcast = datetime::now();
     }
 
+    /// Indicates whether it is timely and relevant to look for new friends by pinging
+    /// all the potential (and non-symmetric) neighbours.
     fn should_ping(&self) -> bool {
         self.count_symmetrics() < min_NS
             && datetime::millis_since(self.last_ping) > MIN_PING_INTERVAL
     }
 
+    /// Looks for new friends by sending a Hello TLV to all the potential
+    /// (and non-symmetric) neighbours.
     fn ping(&mut self, local_id: PeerID) {
         let tlv = Rc::new(TagLengthValue::Hello(local_id, None));
 
@@ -215,13 +303,20 @@ impl<'arena> NeighbourHood<'arena> {
         self.last_ping = datetime::now();
     }
 
+    /// Acknoledges receipt of a message. An "Ack" TLV is sent to all the symmetric
+    /// neighbours.
     fn acknoledge(&self, msg_id: MessageId) {
         let tlv = Rc::new(TagLengthValue::Ack(msg_id));
-        self.for_each(|addr, _| {
-            self.socket.send_single_tlv(addr, Rc::clone(&tlv));
+        self.for_each(|addr, neighbour| {
+            if neighbour.borrow().is_symmetric() {
+                self.socket.send_single_tlv(addr, Rc::clone(&tlv));
+            }
         });
     }
 
+    /// Groups greetings, pinging and neighbourhood broadcast as a
+    /// single "routine" task.
+    /// This method should be called very often.
     fn routine(&mut self, local_id: PeerID) {
         if self.should_greet() {
             self.greet_all(local_id);
@@ -236,6 +331,12 @@ impl<'arena> NeighbourHood<'arena> {
         }
     }
 
+    /// Folds every active neighbour into an accumulator by applying an
+    /// operation. This function returns the final result.
+    /// The closure should take as arguments the reference to the address of the neighbour,
+    /// a reference to the `ActiveNeighbour` object associated to the neighbour, and an
+    /// "accumulator". The order in which the active neighbours are yielded is unspecified.
+    /// This function returns the last value returned by the closure.
     fn fold<T, F>(&self, init: T, mut f: F) -> T
     where
         F: FnMut(&'arena Addr, &Rc<RefCell<ActiveNeighbour<'arena>>>, T) -> T,
@@ -247,6 +348,9 @@ impl<'arena> NeighbourHood<'arena> {
         result
     }
 
+    /// Calls a closure on all the active neighbours, in an unspecified order.
+    /// The closure should take as arguments the reference to the address of the neighbour
+    /// and a reference to the `ActiveNeighbour` object associated to the neighbour.
     fn for_each<F>(&self, mut f: F)
     where
         F: FnMut(&'arena Addr, &Rc<RefCell<ActiveNeighbour<'arena>>>),
@@ -255,16 +359,34 @@ impl<'arena> NeighbourHood<'arena> {
     }
 }
 
-/* #region FloodingState */
+/* #endregion */
 
-struct FloodingState<'arena> {
+/* #region DeliveryStatus */
+
+/// This structure stores information about the status of the
+/// delivery of a determined data to a neighbour.
+/// This structure does not store information about the data in question,
+/// but one DeliveryStatus should be used with one and only one "data".
+struct DeliveryStatus<'arena> {
+    /// Weak reference to the ActiveNeighbour object associated with this neighbour.
+    /// If the neighbour is marked as inactive and removed from the active neighbours
+    /// map before it has acknoledged receipt of the data,
+    /// the weak reference is expected to become invalid, allowing to stop the delivery
+    /// without querying the map.
     neighbour: Weak<RefCell<ActiveNeighbour<'arena>>>,
     flooding_times: u8,
     last_flooding: DateTime,
     next_flooding_delay: u128,
 }
 
-impl<'arena> FloodingState<'arena> {
+impl<'arena> DeliveryStatus<'arena> {
+    /// Creates a new `DeliveryStatus` object.
+    /// `time` is the time the data was received.
+    /// Giving it as a parameter reduces the number of calls
+    /// to [`datetime::now`].
+    /// `neighbour` is the neighbour that will be associated with this
+    /// delivery status.
+    /// `rng` is a reference to a random number generator.
     fn new(
         time: DateTime,
         neighbour: &Rc<RefCell<ActiveNeighbour<'arena>>>,
@@ -280,10 +402,21 @@ impl<'arena> FloodingState<'arena> {
         state
     }
 
+    /// Indicates whether it is timely to undertake a new delivery attempt to this neighbour.
     fn should_flood(&self) -> bool {
         datetime::millis_since(self.last_flooding) > self.next_flooding_delay
     }
 
+    /// Sends the data to this neighbour and updates the delivery status.
+    /// `msg` is the precomputed byte representation of the "Data" TLV (not only
+    /// the UTF-8 message from the user).
+    /// The same data should be given at each call.
+    /// This methods also needs a random number generator and a reference to the socket
+    /// used to send the messages (the object stores no reference of it).
+    /// # Errors
+    /// If the associated neighbour is inactive, or has not acknoledged receipt of the message
+    /// after [`MAX_FLOODING_TIMES`] attempts, this function sends nothing and returns
+    /// `Err(NeighbourInactive)`.
     fn flood(
         &mut self,
         msg: Rc<[u8]>,
@@ -300,12 +433,17 @@ impl<'arena> FloodingState<'arena> {
         Err(NeighbourInactive)
     }
 
+    /// Updates this delivery status by incrementing the number of attempts
+    /// and choosing the time of the next attempt.
+    /// Internal use only (should be called only by `flood`).
     fn flooded(&mut self, rng: &mut StdRng) {
         self.flooding_times += 1;
         self.last_flooding = datetime::now();
         self.next_flooding_delay = self.random_flooding_delay(rng);
     }
 
+    /// Chooses a random delay for the next delivery attempt.
+    /// Internal use only.
     fn random_flooding_delay(&self, rng: &mut StdRng) -> u128 {
         if self.flooding_times == 0 {
             rng.gen_range(500..1000)
@@ -316,10 +454,14 @@ impl<'arena> FloodingState<'arena> {
         }
     }
 
+    /// Indicates whether the delivery of the data to this neighbour should be given up
+    /// due to inactivity.
     fn should_give_up_flooding(&self) -> bool {
         self.flooding_times > MAX_FLOODING_TIMES || self.neighbour.upgrade().is_none()
     }
 
+    /// Get a reference to the address of the neighbour, if it is still active.
+    /// Returns `None` if the neighbour has been removed from the active neighbours map.
     fn get_neighbour_addr(&self) -> Option<&'arena Addr> {
         self.neighbour.upgrade().map(|n| n.borrow().addr)
     }
@@ -329,15 +471,19 @@ impl<'arena> FloodingState<'arena> {
 
 /* #region DataToFlood */
 
+/// This structure stores informations about a recent data.
 struct RecentData<'arena> {
     msg_id: MessageId,
     receive_time: DateTime, //TODO
     precomputed: Rc<[u8]>,
-    neighbours_to_flood: HashMap<&'arena Addr, FloodingState<'arena>>,
+    neighbours_to_flood: HashMap<&'arena Addr, DeliveryStatus<'arena>>,
     socket: &'arena MircHost<'arena>,
 }
 
 impl<'arena> RecentData<'arena> {
+    /// Creates a new `RecentData` object for the `data` with ID `msg_id`.
+    /// The neighbours to flood are initialized with the list of the symmetric
+    /// neighbours from the `neighbours` argument.
     fn new(
         msg_id: MessageId,
         data: Data,
@@ -350,7 +496,7 @@ impl<'arena> RecentData<'arena> {
         let mut neighbours_to_flood = HashMap::new();
         neighbours.for_each(|addr, neighbour| {
             if neighbour.borrow().is_symmetric() {
-                neighbours_to_flood.insert(addr, FloodingState::new(date_now, neighbour, rng));
+                neighbours_to_flood.insert(addr, DeliveryStatus::new(date_now, neighbour, rng));
             }
         });
 
@@ -359,7 +505,7 @@ impl<'arena> RecentData<'arena> {
                 .try_to_bytes()
                 .unwrap_or_default(),
         );
-        
+
         Self {
             msg_id,
             receive_time: date_now,
@@ -369,6 +515,8 @@ impl<'arena> RecentData<'arena> {
         }
     }
 
+    /// Processes an acknoledgment of this message from the specified neighbour.
+    /// The neighbour is removed from the list of the neighbours to flood.
     fn process_ack(&mut self, from: &Addr) {
         if self.neighbours_to_flood.remove(from).is_some() {
             log_info!(
@@ -383,10 +531,16 @@ impl<'arena> RecentData<'arena> {
         }
     }
 
+    /// Indicates whether the message has been delivered to all the expected
+    /// neighbours (expected those who became inactive).
     fn flooding_complete(&self) -> bool {
         self.neighbours_to_flood.is_empty()
     }
 
+    /// Sends the message to all the neighbours that have not acknoledged receipt yet.
+    /// The neighbours who became inactive are automatically removed.
+    /// This function returns the list of the neighbours who have been removed from the queue
+    /// for inactivity.
     fn flood(&mut self, rng: &mut StdRng) -> HashSet<&'arena Addr> {
         let mut inactives = HashSet::new();
 
@@ -410,7 +564,11 @@ impl<'arena> RecentData<'arena> {
 
 /* #endregion */
 
-/* #region DataToFloodCollection */
+/* #region RecentDataMap */
+
+/// This structure contains all the recent data.
+/// It is also responsible for processing the messages that the local
+/// user wants to send.
 struct RecentDataMap<'arena> {
     neighbourhood: Rc<RefCell<NeighbourHood<'arena>>>,
     next_msg_id: u32,
@@ -420,6 +578,15 @@ struct RecentDataMap<'arena> {
 }
 
 impl<'arena> RecentDataMap<'arena> {
+    /// Creates a new `RecentDataMap` for the given `neighbourhood`.
+    ///
+    /// `stream` is the receiver-side of a thread-safe channel.
+    /// The messages should only be written to the sender-side of the same
+    /// channel.
+    /// This system is used instead of exposing functions like `read_stream` or
+    /// `insert_data`, because most of the objects of the API are not
+    /// thread-safe, and wrapping all of them inside thread-safe lockers would
+    /// cause unnecessary overhead.
     fn new(
         neighbourhood: Rc<RefCell<NeighbourHood<'arena>>>,
         stream: Receiver<String>,
@@ -434,6 +601,13 @@ impl<'arena> RecentDataMap<'arena> {
         }
     }
 
+    /// Insert a recent data in the map.
+    /// The neighbours to flood are initialized with the symmetric neighours from
+    /// the (store) neighbourhood.
+    /// This function returns `true` if the message was NOT previously in the map.
+    ///
+    /// Note that nothing is actually sent through the socket until the `flood_all`
+    /// function is called.
     fn insert_data(&mut self, msg_id: MessageId, data: Data, rng: &mut StdRng) -> bool {
         let data = RecentData::new(msg_id, data, &self.neighbourhood.borrow(), rng, self.socket);
         if data.neighbours_to_flood.is_empty() {
@@ -442,12 +616,12 @@ impl<'arena> RecentDataMap<'arena> {
         self.recent_data.try_insert(msg_id, data).is_ok()
     }
 
-    /// Sends a message to all the symmetric neighbours.
-    /// If the message is too large to be sent in a single TLV, it is
-    /// automatically split into multiple TLVs.
+    /// Reads the stream and prepares the delivery of the transmitted messages.
+    /// If a message is too large to fit in a single TLV, it is automaticaly
+    /// split into multiple TLVs.
     ///
-    /// This function does not immediately sends the data, it only
-    /// enqueues it as a data to flood.
+    /// Note that nothing is actually sent through the socket until the `flood_all`
+    /// function is called.
     fn read_stream(&mut self, local_id: PeerID, rng: &mut StdRng) {
         if let Ok(data_str) = self.stream.try_recv() {
             let data_vec = Data::pack(data_str.trim());
@@ -468,6 +642,11 @@ impl<'arena> RecentDataMap<'arena> {
         }
     }
 
+    /// Sends all the messages to the neighbours who have not acknoledged receipt of them yet.
+    /// The data whose delivery is complete are automatically removed from the map.
+    /// The neighbours who have not acknoledged receipt of a message after [`MAX_FLOODING_TIMES`]
+    /// delivery attempts are automatically dismissed. A "GoAway" TLV with code Inactivity is sent to
+    /// them.
     fn flood_all(&mut self, rng: &mut StdRng) {
         let mut inactives = HashSet::new();
         for data in self.recent_data.values_mut() {
@@ -482,6 +661,15 @@ impl<'arena> RecentDataMap<'arena> {
         );
     }
 
+    /// Processes an acknoledgment of this message from the specified neighbour.
+    /// The neighbour is removed from the list of the neighbours to flood for the
+    /// specified message.
+    /// This method essentially calls `process_ack` function of `RecentData`
+    /// and exists only for convenience and syntactic conciseness.
+    ///
+    /// Note: if the specified data is not a recent data, or the message is not
+    /// expecting an acknoledgment from the specified neighbour, this function has
+    /// no effect.
     fn process_ack(&mut self, from: &Addr, msg_id: &MessageId) {
         if let Some(data) = self.recent_data.get_mut(msg_id) {
             data.process_ack(from);
@@ -491,11 +679,15 @@ impl<'arena> RecentDataMap<'arena> {
 
 /* #endregion */
 
+/// Adds a convenience method to some errors.
 trait RemoteError {
-    fn is_remote_fault(&self) -> bool {
-        false
-    }
+    /// This is true if the error should not be considered
+    /// as an actual anomaly.
+    /// This is used only to choose the appropriate verbose level
+    /// when logging errors.
+    fn is_remote_fault(&self) -> bool;
 }
+
 impl RemoteError for std::io::Error {
     fn is_remote_fault(&self) -> bool {
         matches!(
@@ -515,6 +707,10 @@ impl RemoteError for NeighbourInactive {
     }
 }
 
+/// Executes the fallible operation given as the second
+/// argument, and logs the error using the logger given as
+/// the first argument if the operation returns an `Err` result.
+/// The error type should implement RemoteError.
 macro_rules! report_on_fail {
     ($logger: expr, $e: expr) => {
         match $e {
@@ -540,6 +736,14 @@ pub(super) struct MircHost<'arena> {
 }
 
 impl<'arena> MircHost<'arena> {
+    /// Tries to create a new `MircHost` by binding a new `UdpSocket` to
+    /// the specified port.
+    /// This function also needs a logger, borrowed for all the life
+    /// of the new object.
+    /// # Errors
+    /// This functions returns an `Ok` result containing the new object if
+    /// the binding succeeds. Otherwise it returns an `Err` result containing the
+    /// [`std::io::Error`] that has occurred when trying to bind the socket.
     pub fn new(port: u16, logger: &'arena EventLog) -> std::io::Result<Self> {
         let addr = Addr::try_from(("::", port))
             .map_err(|_err| std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))?;
@@ -557,12 +761,20 @@ impl<'arena> MircHost<'arena> {
         })
     }
 
+    /// Flushes the message queue for the specified neighbour, provided auto flushing is
+    /// enabled and the queue is full enough. "Full enough" means full enough to fill
+    /// a whole UDP datagram without leaving blanks.
+    /// Internal use only. See `flood_all` instead.
     fn flush_if_appropriate(&self, to: &Addr, queue: &mut MessageFactory) {
         if self.auto_flush && queue.should_flush() {
             self.flush(to, queue);
         }
     }
 
+    /// Forces to flush the message queue for the specified neighbour, causing
+    /// all the queued messages to be immediately sent through the UDP socket.
+    /// I/O errors that may occur during the process are logged by the logger.
+    /// Internal use only. See `flood_all` instead.
     fn flush(&self, to: &Addr, queue: &mut MessageFactory) {
         while let Some(msg) = queue.build_next() {
             log_debug!(self, "Sending bytes to {to}: {msg:?}");
@@ -570,16 +782,19 @@ impl<'arena> MircHost<'arena> {
         }
     }
 
-    /// Forces to flush the buffer, causing all the messages to be immediately sent to
-    /// the neighbours.
-    /// This method should be called regularly, even if auto-flush is enabled, because
-    /// the buffer may not reach the minimum size for auto-flush in a reasonable delay.
+    /// Forces to flush the buffer for all the neighbours, causing all the messages
+    /// to be immediately sent to the neighbours.
+    /// This method should be called regularly, even if auto-flushing is enabled, because
+    /// the buffer may not reach the minimum size for auto-flushing in a reasonable delay.
     fn flush_all(&self) {
         for (addr, queue) in &mut *self.buffer.borrow_mut() {
             self.flush(addr, queue);
         }
     }
 
+    /// Calls the closure on the message queue associated with the specified neighbour.
+    /// Internal use only. Wrong usage may cause dead locks because this function mutably
+    /// borrows the buffer, and the buffer is still mutably borrowed when the closure is called.
     fn with_queue<F>(&self, to: &'arena Addr, f: F)
     where
         F: FnOnce(&mut MessageFactory),
@@ -633,8 +848,8 @@ impl<'arena> MircHost<'arena> {
 
 /* #region LocalUser */
 
-/// A struct representing the peer
-/// using this local instance of the program
+/// This structure represents the local user of this local
+/// instance of the program
 pub(super) struct LocalUser<'arena> {
     id: PeerID,
     socket: &'arena MircHost<'arena>,
@@ -645,6 +860,12 @@ pub(super) struct LocalUser<'arena> {
 }
 
 impl<'arena> LocalUser<'arena> {
+    /// Creates a new `LocalUser` object.
+    /// - `first_neighbour` is the address of the first neighbour to contact
+    /// - `alloc` is the allocator that will be used for hash consing
+    /// - `receiver` is the receiver-side of a thread-safe channel.
+    /// The messages that the local user wants to send should be passed to
+    /// the sender-side of the same channel.
     pub fn new(
         first_neighbour: Addr,
         alloc: &'arena bumpalo::Bump,
@@ -672,6 +893,9 @@ impl<'arena> LocalUser<'arena> {
         }
     }
 
+    /// Sends a warning to the neighbour, with the specified message.
+    /// The byte size of the message must not exceed 255, otherwise an
+    /// error is logged by the logger.
     fn warn(&self, addr: &'arena Addr, msg: String) {
         let msg = LimitedString::try_from(msg);
         match msg {
@@ -685,8 +909,8 @@ impl<'arena> LocalUser<'arena> {
         }
     }
 
-    /// Process a single TLV from a received datagram.
-    /// 'sender' is the address of the peer that sent the datagram.
+    /// Processes a single TLV from a received datagram.
+    /// `sender` is the address of the peer that sent the datagram.
     fn process_tlv(&mut self, sender: &'arena Addr, tlv: TagLengthValue) {
         match tlv {
             TagLengthValue::Hello(sender_id, receiver) => {
@@ -702,6 +926,7 @@ impl<'arena> LocalUser<'arena> {
                     log_info!(self, "New active neighbour: {sender} (id: {sender_id})");
                 }
                 if receiver.contains(&self.id) {
+                    //symmetric
                     let mut neighbour = neighbour.borrow_mut();
                     neighbour.last_long_hello = neighbour.last_hello;
                 }
@@ -709,13 +934,15 @@ impl<'arena> LocalUser<'arena> {
 
             TagLengthValue::Neighbour(addr) => {
                 if addr != self.socket.local_addr {
-                    self.neighbours.borrow_mut().welcome(addr, false);
+                    self.neighbours.borrow_mut().welcome(addr, true);
                 }
             }
 
             TagLengthValue::Data(msg_id, data) => {
+                // Only data sent from symmetric neighbours are accepted
                 if self.neighbours.borrow().is_symmetric(sender) {
                     if self.data.insert_data(msg_id, data.clone(), &mut self.rng) {
+                        // `insert_data` returns true if it is a new data
                         log_info!(
                             self,
                             "Received new data (id: {0}) from {1}: {2}",
@@ -729,7 +956,6 @@ impl<'arena> LocalUser<'arena> {
                         );
                         report_on_fail!(self.logger, std::io::stdout().lock().write(b"\n"));
                     }
-
                     self.data.process_ack(sender, &msg_id);
                     self.neighbours.borrow().acknoledge(msg_id);
                 } else {
@@ -752,6 +978,11 @@ impl<'arena> LocalUser<'arena> {
             }
 
             TagLengthValue::GoAway(_reason, msg) => {
+                // TODO
+                // If some students' implementations undertake different actions
+                // depending on the GoAwayReason, and also use their own non-standard codes,
+                // using GoAwayReason::Reciprocation might be a problem.
+
                 self.neighbours
                     .borrow_mut()
                     .dismiss(&[sender], GoAwayReason::Reciprocation, None);
@@ -790,6 +1021,12 @@ impl<'arena> LocalUser<'arena> {
         }
     }
 
+    /// Groups all the steps of the protocol in a single routine task.
+    /// The steps are:
+    /// - updating the state of the neighbours, saying hello etc.
+    /// - looking for messages from the local user and preparing their flooding
+    /// - flooding all data to flood (and flush the socket's buffer)
+    /// - looking for messages from remote neighbours
     pub fn routine(&mut self) {
         self.neighbours.borrow_mut().routine(self.id);
 
@@ -798,32 +1035,41 @@ impl<'arena> LocalUser<'arena> {
 
         self.socket.flush_all();
 
-        match self.receive_message() {
-            Ok(()) => (),
-            Err(ParseError::ReceiveFailed(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
-            }
-            Err(ParseError::ReceiveFailed(err)) if err.is_remote_fault() => {
-                self.logger.debug(err);
-            }
-            Err(ParseError::ReceiveFailed(err)) => self.logger.information(err),
-            Err(ParseError::ProtocolViolation(from)) => {
-                if let Some(addr) = self.neighbours.borrow_mut().welcome(from, false) {
-                    self.warn(
-                        addr,
-                        "Protocol violation (no further information). Please abide by the rules. \
-                    This could be more severely punished in a future version."
-                            .to_owned(),
-                    );
+        // If there are too many messages to receive, the rest will wait.
+        // The other routine steps should not stay blocked for too long.
+        for _ in 0..10 {
+            match self.receive_message() {
+                Ok(()) => (),
+                Err(ParseError::ReceiveFailed(err))
+                    if err.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    break;
                 }
+                Err(ParseError::ReceiveFailed(err)) if err.is_remote_fault() => {
+                    self.logger.debug(err);
+                }
+                Err(ParseError::ReceiveFailed(err)) => self.logger.information(err),
+                Err(ParseError::ProtocolViolation(from)) => {
+                    if let Some(addr) = self.neighbours.borrow_mut().welcome(from, false) {
+                        self.warn(
+                            addr,
+                            "Protocol violation (no further information). Please abide by the rules. \
+                        This could be more severely punished in a future version."
+                                .to_owned(),
+                        );
+                    }
+                }
+                Err(ParseError::UnknownSender(addr)) => {
+                    self.logger.anomaly(ParseError::UnknownSender(addr))
+                }
+                Err(err) => self.logger.warning(err),
             }
-            Err(ParseError::UnknownSender(addr)) => self.logger.anomaly(ParseError::UnknownSender(addr)),
-            Err(err) => self.logger.warning(err),
         }
     }
 
     /// Tries to receive a single datagram from the socket.
     /// The received datagram (if any) is then processed.
-    /// When this method completes, more datagrams may still be
+    /// When this method returns, more datagrams may still be
     /// waiting for being processed.
     /// # Errors
     /// This method returns an Err value if
@@ -844,6 +1090,11 @@ impl<'arena> LocalUser<'arena> {
         Ok(())
     }
 
+    /// Notifies all the active neighbours that this user is leaving.
+    /// (Sends a "GoAway" TLV with code "EmitterLeaving", and flushes the socket's buffer).
+    /// 
+    /// Note: this function does nothing else. This object may still be used until
+    /// it is dropped. The active neighbours map is not emptied.
     pub fn shutdown(&self) {
         log_important!(self, "Shutting down...");
         let tlv = Rc::new(TagLengthValue::GoAway(GoAwayReason::EmitterLeaving, None));

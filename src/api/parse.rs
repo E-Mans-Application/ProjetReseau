@@ -1,3 +1,9 @@
+//! This modules contains some of the objects used to parse
+//! UDP datagrams.
+//! An important part of the work is done by `TagLengthValue` in `util`.
+
+use crate::lazy_format;
+
 use super::addresses::Addr;
 use super::error::{ParseError, ParseResult};
 use super::logging::EventLog;
@@ -6,6 +12,8 @@ use std::convert::TryInto;
 use std::net::UdpSocket;
 
 macro_rules! from_be_bytes {
+    // unwrap will not panic because the macro is called with the right number of
+    // bytes for each data type
     ($a:expr, $t:ty) => {
         <$t>::from_be_bytes($a.try_into().unwrap())
     };
@@ -42,6 +50,7 @@ impl<'arena> Buffer<'arena> {
         }
     }
 
+    /// Shortcut to the len of the wrapped array. Internal use only.
     const fn len(&self) -> usize {
         self.wrapped.len()
     }
@@ -92,8 +101,8 @@ impl<'arena> Buffer<'arena> {
         Some(from_be_bytes!(bytes, u128))
     }
 
-    /// Consumes exactly 'count' bytes from the stream, if there is at less
-    /// 'count' bytes remaining. If there is not enough bytes to be read, nothing is consumed
+    /// Consumes exactly 'count' bytes from the stream, if there are at less
+    /// 'count' bytes remaining. If there are not enough bytes to be read, nothing is consumed
     /// and None is returned.
     /// ### Lifetime
     /// This method returns a reference to the corresponding slice of the stream. This reference
@@ -109,7 +118,8 @@ impl<'arena> Buffer<'arena> {
     }
     /// Extracts the next 'count' bytes from this stream and fills them into
     /// a new sub-stream, without copying them.
-    /// If there is less than 'count' bytes remaining, nothing is consumed and
+    /// The position of this buffer is advanced by 'count'.
+    /// If there are less than 'count' bytes remaining, nothing is consumed and
     /// None is returned.
     /// ### Lifetime
     /// The sub-stream cannot outlive this stream.
@@ -139,6 +149,7 @@ impl<'arena> Buffer<'arena> {
 }
 
 /// Allows to parse messages received from a socket.
+/// This is an emtpy struct, with only static methods.
 pub(super) struct MessageParser;
 
 impl MessageParser {
@@ -182,16 +193,21 @@ impl MessageParser {
         let (size, addr) = socket.recv_from(&mut buf)?;
         let addr: Addr = addr.into();
 
-        logger.debug(format!("Received bytes from {addr}: {0:?}", &buf[0..size]));
+        logger.debug(lazy_format!(
+            "Received bytes from {addr}: {0:?}",
+            &buf[0..size]
+        ));
 
         let mut buffer = Buffer::new(&buf[0..size]);
 
+        // Checking that the DGram starts with bytes 95 0.
         Self::check_magic(&mut buffer)?;
         Self::check_version(&mut buffer)?;
 
         let body_length = Self::parse_body_length(&mut buffer)
             .ok_or_else(|| ParseError::ProtocolViolation(addr.clone()))?;
 
+        // Discard bytes according to the specified body length
         buffer
             .shrink(body_length)
             .map_err(|()| ParseError::ProtocolViolation(addr.clone()))?;
@@ -203,7 +219,7 @@ impl MessageParser {
                 Some(tlv) => tags.push(tlv),
                 None if !tags.is_empty() => {
                     logger.warning(format!(
-                        "While processing received bytes from {0}: Parsing interrupted before the end of the message \
+                        "While processing bytes received from {0}: Parsing interrupted before the end of the message \
                         due to a protocol violation. Keeping only the TLVs parsed so far.",
                     &addr));
                     break;

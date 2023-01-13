@@ -1,3 +1,7 @@
+//! This module contains objects used for logging.
+//! They are public to allow the closure in `use_client` to
+//! log events.
+
 /* #region VerboseLevel */
 
 use derive_more::{Display, From};
@@ -6,10 +10,9 @@ use std::sync::Mutex;
 use super::datetime;
 
 /// This enum allows to control how verbose the program should be.
-/// This enum may not be exhaustive. The relative order between the levels
-/// is guaranteed to be stable, but new levels may be added in the future.
-/// Numeric equivalents are not stable, so it's better to use the string representation of
-/// the levels in command line arguments.
+/// This enum may not be exhaustive, the position of the levels may change.
+/// Only the relative order between the levels is reliable.
+/// In command-line arguments, prefer using the string representation to numeric values.
 #[derive(PartialEq, Eq, PartialOrd, Ord, From, Clone, Copy, Debug, Display, Default)]
 #[repr(u8)]
 pub enum VerboseLevel {
@@ -102,21 +105,25 @@ impl std::str::FromStr for VerboseLevel {
 /// The methods use trait `ToStringOnce` (see below), that is implemented by all
 /// `ToString` objects, and by the struct `LazyFormat` (see below)
 pub struct EventLog {
-    min_level: VerboseLevel,
+    max_level: VerboseLevel,
     barrier: Mutex<()>,
 }
 
 impl EventLog {
-    pub const fn new(min_level: VerboseLevel) -> Self {
+    /// Creates a new EventLog, that shall log only the events that have at
+    /// most verbose level `max_level`.
+    pub const fn new(max_level: VerboseLevel) -> Self {
         Self {
-            min_level,
+            max_level: max_level,
             barrier: Mutex::new(()),
         }
     }
 
     pub fn log_event<T: ToStringOnce>(&self, severity: VerboseLevel, msg: T) {
         if self.barrier.lock().is_ok() {
-            if severity <= self.min_level {
+            // Synchronization
+            if severity <= self.max_level {
+                // For now, the logger sends the event to stderr.
                 eprintln!(
                     "[{0}] {1}: {2}",
                     datetime::now_formatted(),
@@ -129,6 +136,8 @@ impl EventLog {
             std::process::exit(6)
         }
     }
+
+    // The following are self-explanatory convenience methods.
 
     pub fn error<T: ToStringOnce>(&self, msg: T) {
         self.log_event(VerboseLevel::InternalError, msg);
@@ -168,9 +177,6 @@ impl EventLog {
 pub trait ToStringOnce {
     fn to_string_once(self) -> String;
 }
-pub struct LazyFormat<Closure>(pub Closure)
-where
-    Closure: FnOnce() -> String;
 
 // Who can do more can do less.
 impl<T: ToString> ToStringOnce for T {
@@ -178,6 +184,11 @@ impl<T: ToString> ToStringOnce for T {
         self.to_string()
     }
 }
+
+/// A wrapper around a closure that lazily produces a string value.
+pub struct LazyFormat<Closure>(pub Closure)
+where
+    Closure: FnOnce() -> String;
 
 impl<Closure: FnOnce() -> String> ToStringOnce for LazyFormat<Closure> {
     fn to_string_once(self) -> String {
@@ -188,6 +199,9 @@ impl<Closure: FnOnce() -> String> ToStringOnce for LazyFormat<Closure> {
 // Convenience macros to use lazy formatting more easily and to have a
 // more concise syntax.
 
+/// The same as `format!` with lazy evaluation.
+/// The first argument should be a format string (it must be a string literal).
+/// The values captures in the closure must stay valid until the closure is dropped.
 #[macro_export]
 macro_rules! lazy_format {
     ($($args: tt)*) => {
@@ -195,36 +209,42 @@ macro_rules! lazy_format {
     }
 }
 
+/// Convenience macro that logs a warning from an object with a `logger` field.
 #[macro_export]
 macro_rules! log_warning {
     ($self: expr, $($args: tt)*) => {
         $self.logger.warning(lazy_format!($($args)*));
     }
 }
+/// Convenience macro that logs an anomaly from an object with a `logger` field.
 #[macro_export]
 macro_rules! log_anomaly {
     ($self: expr, $($args: tt)*) => {
         $self.logger.anomaly(lazy_format!($($args)*));
     }
 }
+/// Convenience macro that logs an important event from an object with a `logger` field.
 #[macro_export]
 macro_rules! log_important {
     ($self: expr, $($args: tt)*) => {
         $self.logger.important(lazy_format!($($args)*));
     }
 }
+/// Convenience macro that logs an informative event from an object with a `logger` field.
 #[macro_export]
 macro_rules! log_info {
     ($self: expr, $($args: tt)*) => {
         $self.logger.information(lazy_format!($($args)*));
     }
 }
+/// Convenience macro that logs a trace event from an object with a `logger` field.
 #[macro_export]
 macro_rules! log_trace {
     ($self: expr, $($args: tt)*) => {
         $self.logger.trace(lazy_format!($($args)*));
     }
 }
+/// Convenience macro that logs a debug event from an object with a `logger` field.
 #[macro_export]
 macro_rules! log_debug {
     ($self: expr, $($args: tt)*) => {

@@ -67,14 +67,15 @@ fn main() -> Result<(), error::UseClientError> {
         .and_then(|s| VerboseLevel::from_str(&s))
         .unwrap_or_default();
     println!("Verbose level: {verbose_level}");
-
+    
+    // unwrap: no matter if it panics, because the program should exit anyway in this case.
+    let mut rl = rustyline::Editor::<()>::new().unwrap();
+    
     use_client(
         args.port,
         &args.first_neighbour,
         verbose_level,
         |sender, logger| {
-            // unwrap: no matter if it panics, because the program should exit anyway in this case.
-            let mut rl = rustyline::Editor::<()>::new().unwrap();
             loop {
                 let readline = rl.readline("");
                 match readline {

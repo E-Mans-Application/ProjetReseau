@@ -1,3 +1,7 @@
+//! This modules contains the structure `Addr`.
+//! The structure was removed from module `util`
+//! because it was becoming too big.
+
 use std::convert::TryFrom;
 use std::fmt::{Debug, Display};
 use std::net::{self, IpAddr, SocketAddr, ToSocketAddrs};
@@ -5,6 +9,7 @@ use std::str::FromStr;
 
 use super::parse::Buffer;
 
+/// An opaque wrapper representing an Ipv6 address.
 #[derive(Eq, Hash, Debug, Clone)]
 pub struct Addr {
     addr: net::Ipv6Addr,
@@ -13,10 +18,13 @@ pub struct Addr {
 
 impl PartialEq for Addr {
     fn eq(&self, other: &Self) -> bool {
-        self.port == other.port &&
-            ((self.addr == net::Ipv6Addr::UNSPECIFIED && other.addr == net::Ipv6Addr::LOCALHOST) ||
-            (other.addr == net::Ipv6Addr::UNSPECIFIED && self.addr == net::Ipv6Addr::LOCALHOST)  || 
-            self.addr == other.addr)
+        // This allows to check whether an address is the same as the local socket, when
+        // the socket is bound to the UNSPECIFIED address.
+        self.port == other.port
+            && ((self.addr == net::Ipv6Addr::UNSPECIFIED && other.addr == net::Ipv6Addr::LOCALHOST)
+                || (other.addr == net::Ipv6Addr::UNSPECIFIED
+                    && self.addr == net::Ipv6Addr::LOCALHOST)
+                || self.addr == other.addr)
     }
 }
 
