@@ -11,3 +11,4 @@ crossbeam = "0.8.2"
 chrono = {version =  "0.4.23", features = ["clock"] }
 ctrlc = "3.2.4"
 rustyline = "10.0.0"
+socket2= "0.4.7"

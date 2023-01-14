@@ -10,7 +10,7 @@ use std::{
     convert::TryFrom,
     io::Write,
     iter::FromIterator,
-    net::UdpSocket,
+    net::{SocketAddr, UdpSocket},
     rc::{Rc, Weak},
 };
 
@@ -22,9 +22,23 @@ use super::{
     parse::MessageParser,
     util::{Data, GoAwayReason, LimitedString, MessageFactory, MessageId, PeerID, TagLengthValue},
 };
-use crate::{lazy_format, log_anomaly, log_debug, log_important, log_info, log_trace, log_warning};
+use crate::{
+    api::parse::Buffer, lazy_format, log_anomaly, log_debug, log_important, log_info, log_trace,
+    log_warning,
+};
 
 /* #region PARAMETERS */
+
+/// Indicates whether the socket should use dual-stack to support
+/// IPv4 clients. This may not be supported, or not desired, on some
+/// systems. Failure to apply this setting will be reported but is not
+/// a hard error.
+///
+///  If [`IPV6_ONLY`] is `true`, the user will not be
+/// able to send and receive messages to/from IPv4-mapped addresses.
+/// In this case, the address of the first neighbour must be a genuine
+/// IPv6 address.
+const IPV6_ONLY: bool = false;
 
 /// Indicates whether uninvited neighbours are allowed
 /// to send messages to this client.
@@ -39,27 +53,41 @@ use crate::{lazy_format, log_anomaly, log_debug, log_important, log_info, log_tr
 /// Otherwise, messages from uninvited clients won't be processed.
 const ALLOW_SELF_INVITATION: bool = false;
 
-/// Minimum expected number of symmetric neighbours.
+/// Minimum desired number of symmetric neighbours.
 /// If the number of symmetric neighbours is lower,
 /// an "Hello" TLV will be sent to all the non-symmetric
 /// neighbours.
-const min_NS: usize = 1; //TODO
+///
+/// Note: named "min_NS" in the subject.
+const MIN_DESIRED_SYMMETRIC: usize = 1; //TODO
 
 /// Delay (in milliseconds) after which a neighbour is marked as inactive
-/// if it does not say hello. (Fixed by the subject)
+/// if it does not say hello. (Set by the subject)
 const ACTIVITY_TIMEOUT: u128 = 120_000;
 
 /// Delay (in milliseconds) after which a neighbour is marked as non-symmetric
-/// if it does not send a long hello. (Fixed by the subject)
+/// if it does not send a long hello. (Set by the subject)
 const SYMMETRY_TIMEOUT: u128 = 120_000;
 
 /// Number of times a "Data" TLV should be sent to a neighbour
 /// before the neighbour is considered as inactive (unless it
-/// sends acknoledgment). (Fixed by the subject)
+/// sends acknoledgment). (Set by the subject)
 const MAX_FLOODING_TIMES: u8 = 5;
 
+/// Maximum number of recent data to keep. When this number is exceeded,
+/// the oldest message will have its flooding given up, even if not all
+/// the symmetric neighbours have acknoledged receipt of them.
+/// Set to 0 to disable the limit.
+const MAX_RECENT_DATA_COUNT: usize = 1;
+
+/// Maximum age of a recent datum (in milliseconds).
+/// Data older than this age will have their flooding given up,
+/// even if not all the symmetric neighbours have acknoledged receipt of them.
+/// Set to 0 to disable the limit.
+const MAX_RECENT_DATA_AGE: u128 = 1;
+
 /// Interval (in milliseconds) at which to say hello to the active neighbours.
-/// (Fixed by the subject)
+/// (Set by the subject)
 const HELLO_INTERVAL: u128 = 30_000;
 
 /// Interval (in milliseconds) at which to send the list of symmetric neighbours
@@ -67,7 +95,7 @@ const HELLO_INTERVAL: u128 = 30_000;
 const NEIGHBOURHOOD_BROADCAST_INTERVAL: u128 = 30_000;
 
 /// The minimum interval (in milliseconds) between two "pings" to the potential neighbours.
-/// (A ping is the operation performed when `min_NS` is not respected.)
+/// (A ping is the operation performed when [`MIN_DESIRED_SYMMETRIC`] is not respected.)
 const MIN_PING_INTERVAL: u128 = 30_000;
 
 /* #endregion */
@@ -215,16 +243,21 @@ impl<'arena> NeighbourHood<'arena> {
             .is_some_and(|n| n.borrow().is_symmetric())
     }
 
+    /// Convenience method to create a "GoAway" TLV with the specified `reason` and `msg`.
+    fn create_go_away_tlv(reason: GoAwayReason, msg: Option<String>) -> TagLengthValue {
+        TagLengthValue::GoAway(
+            reason,
+            msg.map(|m| LimitedString::try_from(m).map_err(|_err| ParseError::StringTooLarge)),
+        )
+    }
+
     /// Dismisses all the neighbours contained in the array `who`.
     /// The neighbours are removed from the active neighbour map, but are kept from
     /// the potential neighbour map.
     /// A "GoAway" TLV with the given `reason` and `msg` is sent to all the dismissed
     /// neighbours.
     fn dismiss(&mut self, who: &[&'arena Addr], reason: GoAwayReason, msg: Option<String>) {
-        let msg = Rc::new(TagLengthValue::GoAway(
-            reason,
-            msg.map(|m| LimitedString::try_from(m).map_err(|_err| ParseError::StringTooLarge)),
-        ));
+        let msg = Rc::new(NeighbourHood::create_go_away_tlv(reason, msg));
 
         for addr in who {
             log_info!(self.socket, "Neighbour {0} is now inactive.", addr);
@@ -286,7 +319,7 @@ impl<'arena> NeighbourHood<'arena> {
     /// Indicates whether it is timely and relevant to look for new friends by pinging
     /// all the potential (and non-symmetric) neighbours.
     fn should_ping(&self) -> bool {
-        self.count_symmetrics() < min_NS
+        self.count_symmetrics() < MIN_DESIRED_SYMMETRIC
             && datetime::millis_since(self.last_ping) > MIN_PING_INTERVAL
     }
 
@@ -364,13 +397,13 @@ impl<'arena> NeighbourHood<'arena> {
 /* #region DeliveryStatus */
 
 /// This structure stores information about the status of the
-/// delivery of a determined data to a neighbour.
-/// This structure does not store information about the data in question,
-/// but one DeliveryStatus should be used with one and only one "data".
+/// delivery of a determined datum to a neighbour.
+/// This structure does not store information about the datum in question,
+/// but one DeliveryStatus should be used with one and only one datum.
 struct DeliveryStatus<'arena> {
     /// Weak reference to the ActiveNeighbour object associated with this neighbour.
     /// If the neighbour is marked as inactive and removed from the active neighbours
-    /// map before it has acknoledged receipt of the data,
+    /// map before it has acknoledged receipt of the datum,
     /// the weak reference is expected to become invalid, allowing to stop the delivery
     /// without querying the map.
     neighbour: Weak<RefCell<ActiveNeighbour<'arena>>>,
@@ -381,7 +414,7 @@ struct DeliveryStatus<'arena> {
 
 impl<'arena> DeliveryStatus<'arena> {
     /// Creates a new `DeliveryStatus` object.
-    /// `time` is the time the data was received.
+    /// `time` is the time the datum was received.
     /// Giving it as a parameter reduces the number of calls
     /// to [`datetime::now`].
     /// `neighbour` is the neighbour that will be associated with this
@@ -407,10 +440,10 @@ impl<'arena> DeliveryStatus<'arena> {
         datetime::millis_since(self.last_flooding) > self.next_flooding_delay
     }
 
-    /// Sends the data to this neighbour and updates the delivery status.
+    /// Sends the datum to this neighbour and updates the delivery status.
     /// `msg` is the precomputed byte representation of the "Data" TLV (not only
     /// the UTF-8 message from the user).
-    /// The same data should be given at each call.
+    /// The same datum should be given at each call.
     /// This methods also needs a random number generator and a reference to the socket
     /// used to send the messages (the object stores no reference of it).
     /// # Errors
@@ -454,7 +487,7 @@ impl<'arena> DeliveryStatus<'arena> {
         }
     }
 
-    /// Indicates whether the delivery of the data to this neighbour should be given up
+    /// Indicates whether the delivery of the datum to this neighbour should be given up
     /// due to inactivity.
     fn should_give_up_flooding(&self) -> bool {
         self.flooding_times > MAX_FLOODING_TIMES || self.neighbour.upgrade().is_none()
@@ -471,8 +504,8 @@ impl<'arena> DeliveryStatus<'arena> {
 
 /* #region DataToFlood */
 
-/// This structure stores informations about a recent data.
-struct RecentData<'arena> {
+/// This structure stores informations about a recent datum.
+struct RecentDatum<'arena> {
     msg_id: MessageId,
     receive_time: DateTime, //TODO
     precomputed: Rc<[u8]>,
@@ -480,7 +513,7 @@ struct RecentData<'arena> {
     socket: &'arena MircHost<'arena>,
 }
 
-impl<'arena> RecentData<'arena> {
+impl<'arena> RecentDatum<'arena> {
     /// Creates a new `RecentData` object for the `data` with ID `msg_id`.
     /// The neighbours to flood are initialized with the list of the symmetric
     /// neighbours from the `neighbours` argument.
@@ -573,7 +606,7 @@ struct RecentDataMap<'arena> {
     neighbourhood: Rc<RefCell<NeighbourHood<'arena>>>,
     next_msg_id: u32,
     stream: Receiver<String>,
-    recent_data: HashMap<MessageId, RecentData<'arena>>,
+    recent_data: HashMap<MessageId, RecentDatum<'arena>>,
     socket: &'arena MircHost<'arena>,
 }
 
@@ -601,7 +634,7 @@ impl<'arena> RecentDataMap<'arena> {
         }
     }
 
-    /// Insert a recent data in the map.
+    /// Insert a recent datum in the map.
     /// The neighbours to flood are initialized with the symmetric neighours from
     /// the (store) neighbourhood.
     /// This function returns `true` if the message was NOT previously in the map.
@@ -609,7 +642,7 @@ impl<'arena> RecentDataMap<'arena> {
     /// Note that nothing is actually sent through the socket until the `flood_all`
     /// function is called.
     fn insert_data(&mut self, msg_id: MessageId, data: Data, rng: &mut StdRng) -> bool {
-        let data = RecentData::new(msg_id, data, &self.neighbourhood.borrow(), rng, self.socket);
+        let data = RecentDatum::new(msg_id, data, &self.neighbourhood.borrow(), rng, self.socket);
         if data.neighbours_to_flood.is_empty() {
             log_important!(self.socket, "There is nobody to send your message to...");
         }
@@ -643,7 +676,7 @@ impl<'arena> RecentDataMap<'arena> {
     }
 
     /// Sends all the messages to the neighbours who have not acknoledged receipt of them yet.
-    /// The data whose delivery is complete are automatically removed from the map.
+    /// Data whose delivery is complete are automatically removed from the map.
     /// The neighbours who have not acknoledged receipt of a message after [`MAX_FLOODING_TIMES`]
     /// delivery attempts are automatically dismissed. A "GoAway" TLV with code Inactivity is sent to
     /// them.
@@ -667,12 +700,34 @@ impl<'arena> RecentDataMap<'arena> {
     /// This method essentially calls `process_ack` function of `RecentData`
     /// and exists only for convenience and syntactic conciseness.
     ///
-    /// Note: if the specified data is not a recent data, or the message is not
+    /// Note: if the specified datum is not a recent datum, or the message is not
     /// expecting an acknoledgment from the specified neighbour, this function has
     /// no effect.
     fn process_ack(&mut self, from: &Addr, msg_id: &MessageId) {
         if let Some(data) = self.recent_data.get_mut(msg_id) {
             data.process_ack(from);
+        }
+    }
+
+    /// Cleans the map such that, when this function returns,
+    /// it has at most [`MAX_RECENT_DATA_COUNT`] (\*) items and
+    /// contains only data younger than [`MAX_RECENT_DATA_AGE`] (\*).
+    /// The data removed have their flooding given up.
+    /// 
+    /// (*) only if those parameters are non-null.
+    fn clean(&mut self) {
+        while MAX_RECENT_DATA_COUNT > 0 && self.recent_data.len() > MAX_RECENT_DATA_COUNT {
+            let mut min: Option<(MessageId, DateTime)> = None;
+            for data in self.recent_data.values() {
+                if min.is_none() || min.unwrap().1 < data.receive_time {
+                    min = Some((data.msg_id, data.receive_time));
+                }
+            }
+            self.recent_data.remove(&min.unwrap().0);
+        }
+
+        if MAX_RECENT_DATA_AGE > 0 {
+            self.recent_data.retain(|_, d| datetime::millis_since(d.receive_time) <= MAX_RECENT_DATA_AGE);
         }
     }
 }
@@ -747,9 +802,18 @@ impl<'arena> MircHost<'arena> {
     pub fn new(port: u16, logger: &'arena EventLog) -> std::io::Result<Self> {
         let addr = Addr::try_from(("::", port))
             .map_err(|_err| std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))?;
-        let socket = UdpSocket::bind(addr)?;
+
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        // Failure to set IPV6_ONLY should not be a fatal error.
+        report_on_fail!(logger, socket.set_only_v6(IPV6_ONLY));
+        socket.bind(&SocketAddr::from(addr).into())?;
         socket.set_nonblocking(true)?;
 
+        let socket: UdpSocket = socket.into();
         let local_addr: Addr = socket.local_addr()?.into();
 
         Ok(Self {
@@ -789,6 +853,13 @@ impl<'arena> MircHost<'arena> {
     fn flush_all(&self) {
         for (addr, queue) in &mut *self.buffer.borrow_mut() {
             self.flush(addr, queue);
+        }
+    }
+
+    /// Cancels the delivery of all the awaiting messages.
+    fn cancel_all(&self) {
+        for queue in self.buffer.borrow_mut().values_mut() {
+            queue.clear();
         }
     }
 
@@ -837,10 +908,29 @@ impl<'arena> MircHost<'arena> {
         }
     }
 
-    /// Receives a message sent by a neighbour (if any), or
+    /// Receives a message sent by an invited neighbour (if any), or
     /// returns the parse error.
-    fn receive_message(&self) -> ParseResult<(Addr, Vec<TagLengthValue>)> {
-        MessageParser::try_parse(&self.socket, self.logger)
+    /// `neighbours` will be used to check whether the sender is invited.
+    fn receive_message(
+        &self,
+        neighbours: &Rc<RefCell<NeighbourHood<'arena>>>,
+    ) -> ParseResult<(&'arena Addr, Vec<TagLengthValue>)> {
+        let mut buf = [0; 1024];
+        let (size, addr) = self.socket.recv_from(&mut buf)?;
+
+        let addr: Addr = addr.into();
+        let addr = neighbours
+            .borrow_mut()
+            .welcome(addr.clone(), false)
+            .ok_or(ParseError::UnknownSender(addr))?;
+
+        log_debug!(self, "Received bytes from {addr}: {0:?}", &buf[0..size]);
+
+        let mut buffer = Buffer::new(&buf[0..size]);
+        Ok((
+            addr,
+            MessageParser::try_parse(addr, &mut buffer, &self.logger)?,
+        ))
     }
 }
 
@@ -1032,6 +1122,7 @@ impl<'arena> LocalUser<'arena> {
 
         self.data.read_stream(self.id, &mut self.rng);
         self.data.flood_all(&mut self.rng);
+        self.data.clean();
 
         self.socket.flush_all();
 
@@ -1043,7 +1134,7 @@ impl<'arena> LocalUser<'arena> {
                 Err(ParseError::ReceiveFailed(err))
                     if err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
-                    break;
+                    break
                 }
                 Err(ParseError::ReceiveFailed(err)) if err.is_remote_fault() => {
                     self.logger.debug(err);
@@ -1076,12 +1167,7 @@ impl<'arena> LocalUser<'arena> {
     /// - no datagram has been received,
     /// - the received datagram could not be parsed.
     fn receive_message(&mut self) -> ParseResult<()> {
-        let (addr, msg) = self.socket.receive_message()?;
-        let addr = self
-            .neighbours
-            .borrow_mut()
-            .welcome(addr.clone(), false)
-            .ok_or(ParseError::UnknownSender(addr))?;
+        let (addr, msg) = self.socket.receive_message(&self.neighbours)?;
 
         for tlv in msg {
             log_trace!(self, "Received TLV from {0}: {1:?}", addr, &tlv);
@@ -1090,14 +1176,19 @@ impl<'arena> LocalUser<'arena> {
         Ok(())
     }
 
-    /// Notifies all the active neighbours that this user is leaving.
+    /// Cancels the delivery of all the awaiting messages and notifies all the
+    /// active neighbours that this user is leaving.
     /// (Sends a "GoAway" TLV with code "EmitterLeaving", and flushes the socket's buffer).
-    /// 
+    ///
     /// Note: this function does nothing else. This object may still be used until
-    /// it is dropped. The active neighbours map is not emptied.
+    /// it is dropped.
     pub fn shutdown(&self) {
         log_important!(self, "Shutting down...");
-        let tlv = Rc::new(TagLengthValue::GoAway(GoAwayReason::EmitterLeaving, None));
+        self.socket.cancel_all();
+        let tlv = Rc::new(NeighbourHood::create_go_away_tlv(
+            GoAwayReason::EmitterLeaving,
+            Some("Good bye!".to_owned()),
+        ));
         self.neighbours.borrow_mut().for_each(|addr, _| {
             self.socket.send_single_tlv(addr, Rc::clone(&tlv));
         });

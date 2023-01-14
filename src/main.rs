@@ -67,27 +67,25 @@ fn main() -> Result<(), error::UseClientError> {
         .and_then(|s| VerboseLevel::from_str(&s))
         .unwrap_or_default();
     println!("Verbose level: {verbose_level}");
-    
+
     // unwrap: no matter if it panics, because the program should exit anyway in this case.
     let mut rl = rustyline::Editor::<()>::new().unwrap();
-    
+
     use_client(
         args.port,
         &args.first_neighbour,
         verbose_level,
-        |sender, logger| {
-            loop {
-                let readline = rl.readline("");
-                match readline {
-                    Ok(line) => {
-                        if let Err(err) = sender.send(line) {
-                            logger.error(lazy_format!(
-                                "Error when transmitting data to local server: {err}"
-                            ));
-                        }
+        |sender, logger| loop {
+            let readline = rl.readline("");
+            match readline {
+                Ok(line) => {
+                    if let Err(err) = sender.send(line) {
+                        logger.error(lazy_format!(
+                            "Error when transmitting data to local server: {err}"
+                        ));
                     }
-                    Err(_err) => return,
                 }
+                Err(_err) => return,
             }
         },
     )

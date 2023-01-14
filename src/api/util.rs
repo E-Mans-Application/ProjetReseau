@@ -4,21 +4,24 @@
 extern crate derive_more;
 extern crate rand;
 
+use rand::distributions::uniform::SampleBorrow;
+
 use self::rand::RngCore;
 
 use self::derive_more::Display;
 use super::addresses::Addr;
 use super::error::{ParseError, ParseResult, SerializationError, SerializationResult};
 use super::parse;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::rc::Rc;
 
-pub const PROTOCOL_MAGIC: u8 = 95;
-pub const PROTOCOL_VERSION: u8 = 0;
+pub(super) const PROTOCOL_MAGIC: u8 = 95;
+pub(super) const PROTOCOL_VERSION: u8 = 0;
 const MAX_SDU_SIZE: usize = 1024;
 
-pub static EMPTY_BYTE_VEC: Vec<u8> = vec![];
+pub(super) static EMPTY_BYTE_VEC: Vec<u8> = vec![];
 
 /* #region PeerID */
 
@@ -149,7 +152,7 @@ impl<const S: usize> LimitedString<S> {
     }
 }
 
-/// A specific alias for the data sent in the TLVs 'Data'.
+/// A specific alias for data sent in the TLVs 'Data'.
 pub(super) type Data = LimitedString<235>;
 
 /* #endregion */
@@ -319,7 +322,7 @@ impl TagLengthValue {
 
     /// Returns the first part of a Data or an Ack TLV
     /// The first part is defined as: [tag, length, message id...], that is, the TLV
-    /// without the data.
+    /// without the datum.
     /// For the Ack TLV, this is actually the whole TLV.
     fn data_header(tag: u8, msg_id: &MessageId, data_len: usize) -> Vec<u8> {
         let mut bytes = vec![tag];
@@ -488,7 +491,8 @@ impl MessageFactory {
         self.buffer.push_back(MessagePart::Precomputed(bytes));
     }
 
-    /// Indicates whether the
+    /// Indicates whether the queue is full enough to build a complete
+    /// datagram (leaving as few blanks as possible) and should be flushed.
     pub const fn should_flush(&self) -> bool {
         self.total_bytes >= MAX_SDU_SIZE - 4
     }
@@ -496,6 +500,7 @@ impl MessageFactory {
     /// Builds a single SDU from the queue, by concatenating
     /// as many enqueued TLVs as possible without exceeding the
     /// maximum length of a SDU. Those TLVs are removed from the queue.
+    /// The initial order of the TLVs is preserved.
     /// The returned value should be sent as-is.
     /// When this method returns, there may still be TLVs in the queue.
     pub fn build_next(&mut self) -> Option<Vec<u8>> {
@@ -521,6 +526,60 @@ impl MessageFactory {
 
         Some(vec)
     }
+
+    /// Clears the queue, discarding all the enqueued TLVs.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
 }
 
 /* #endregion */
+
+pub(super) struct LinkedPosition {
+    position: u8,
+    previous: Option<Rc<RefCell<LinkedPosition>>>,
+    next: Option<Rc<RefCell<LinkedPosition>>>,
+}
+
+impl LinkedPosition {
+    pub const fn new() -> Self {
+        Self { position: 0, previous: None, next: None }
+    }
+
+    fn recurse<F>(&mut self, mut f: F) where F : FnMut(&mut LinkedPosition) {
+        f(self);
+        if let Some(next) = &self.next {
+            next.borrow_mut().recurse(f);
+        }
+    }
+
+    fn increase(&mut self) {
+        self.recurse(|p| p.position += 1);
+    }
+    fn decrease(&mut self) {
+        self.recurse(|p| p.position -= 1);
+    }
+
+    pub fn make_room(who: Rc<RefCell<LinkedPosition>>) -> Rc<RefCell<Self>> {
+        let mut borrow = who.borrow_mut();
+        borrow.increase();
+
+        let previous = Rc::new(RefCell::new(Self { position: 0, previous: None, next: None }));
+        borrow.previous = Some(Rc::clone(&previous));        
+        drop(borrow);
+
+        previous.borrow_mut().next = Some(who);
+        previous
+    }
+
+    pub fn withdraw(self) {
+        if let Some(previous) = &self.previous {
+            previous.borrow_mut().next = self.next.as_ref().map(Rc::clone);
+        }
+        if let Some(next) = &self.next {
+            let mut next = next.borrow_mut();
+            next.previous = self.previous;
+            next.decrease();
+        }
+    }
+}

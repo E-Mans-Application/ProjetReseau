@@ -43,9 +43,15 @@ impl std::fmt::Display for Addr {
 
 impl net::ToSocketAddrs for Addr {
     type Iter = std::option::IntoIter<net::SocketAddr>;
-
+    // Deprecated (no longer used).
     fn to_socket_addrs(&self) -> std::io::Result<Self::Iter> {
-        (self.addr, self.port).to_socket_addrs()
+        Into::<SocketAddr>::into((self.addr, self.port)).to_socket_addrs()
+    }
+}
+
+impl From<Addr> for SocketAddr {
+    fn from(value: Addr) -> Self {
+        SocketAddr::new(IpAddr::V6(value.addr), value.port)
     }
 }
 

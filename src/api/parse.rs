@@ -176,35 +176,24 @@ impl MessageParser {
         buffer.next_u16().map(|size| size as usize)
     }
 
-    /// Tries to receive a single datagram message from the socket, then
-    /// tries to parse TLVs from the message.
+    /// Tries to parse TLVs from a byte array corresponding to a MIRC
+    /// datagram. `addr` is the address of the sender of the datagram.
     /// # Errors
     /// Returns an Err value if
-    /// - no datagram has been received,
-    /// - the received datagram is not a valid supported MIRC datagram,
-    /// - the received datagram contains no valid TLV.
+    /// - the array does not correspond to a valid supported MIRC datagram,
+    /// - the array contains no valid TLV.
     /// If the parsing fails after some TLVs have been found, the parsing
     /// is interrupted, those TLVs are returned and the event is logged.
     pub fn try_parse(
-        socket: &UdpSocket,
+        addr: &Addr,
+        buffer: &mut Buffer,
         logger: &EventLog,
-    ) -> ParseResult<(Addr, Vec<TagLengthValue>)> {
-        let mut buf = [0; 1024];
-        let (size, addr) = socket.recv_from(&mut buf)?;
-        let addr: Addr = addr.into();
-
-        logger.debug(lazy_format!(
-            "Received bytes from {addr}: {0:?}",
-            &buf[0..size]
-        ));
-
-        let mut buffer = Buffer::new(&buf[0..size]);
-
+    ) -> ParseResult<Vec<TagLengthValue>> {
         // Checking that the DGram starts with bytes 95 0.
-        Self::check_magic(&mut buffer)?;
-        Self::check_version(&mut buffer)?;
+        Self::check_magic(buffer)?;
+        Self::check_version(buffer)?;
 
-        let body_length = Self::parse_body_length(&mut buffer)
+        let body_length = Self::parse_body_length(buffer)
             .ok_or_else(|| ParseError::ProtocolViolation(addr.clone()))?;
 
         // Discard bytes according to the specified body length
@@ -215,18 +204,18 @@ impl MessageParser {
         let mut tags = vec![];
 
         while buffer.has_next() {
-            match TagLengthValue::try_parse(&mut buffer) {
+            match TagLengthValue::try_parse(buffer) {
                 Some(tlv) => tags.push(tlv),
                 None if !tags.is_empty() => {
                     logger.warning(format!(
                         "While processing bytes received from {0}: Parsing interrupted before the end of the message \
                         due to a protocol violation. Keeping only the TLVs parsed so far.",
-                    &addr));
+                    addr));
                     break;
                 }
-                None => return Err(ParseError::ProtocolViolation(addr)),
+                None => return Err(ParseError::ProtocolViolation(addr.clone())),
             }
         }
-        Ok((addr, tags))
+        Ok(tags)
     }
 }
