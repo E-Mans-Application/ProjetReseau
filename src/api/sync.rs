@@ -74,7 +74,7 @@ impl<S> ControlThread<S> {
 
 /// Spawns a controllable, scoped thread.
 /// `scope` is the value obtained by [`crossbeam::scope`].
-/// `f` is a closure that takes a ControlThread object.
+/// `f` is a closure that takes a `ControlThread` object.
 pub fn spawn_control<'env, 'scope, F, T, S>(
     scope: &'scope Scope<'env>,
     f: F,

@@ -9,7 +9,6 @@ use super::error::{ParseError, ParseResult};
 use super::logging::EventLog;
 use super::util::{self, TagLengthValue};
 use std::convert::TryInto;
-use std::net::UdpSocket;
 
 macro_rules! from_be_bytes {
     // unwrap will not panic because the macro is called with the right number of
@@ -207,10 +206,9 @@ impl MessageParser {
             match TagLengthValue::try_parse(buffer) {
                 Some(tlv) => tags.push(tlv),
                 None if !tags.is_empty() => {
-                    logger.warning(format!(
-                        "While processing bytes received from {0}: Parsing interrupted before the end of the message \
-                        due to a protocol violation. Keeping only the TLVs parsed so far.",
-                    addr));
+                    logger.warning(lazy_format!(
+                        "While processing bytes received from {addr}: Parsing interrupted before the end of the message \
+                        due to a protocol violation. Keeping only the TLVs parsed so far."));
                     break;
                 }
                 None => return Err(ParseError::ProtocolViolation(addr.clone())),

@@ -38,6 +38,12 @@ use crate::{
 /// able to send and receive messages to/from IPv4-mapped addresses.
 /// In this case, the address of the first neighbour must be a genuine
 /// IPv6 address.
+/// 
+/// ### Note on invitations:
+/// If [`ALLOW_SELF_INVITATION`] is `false`, then the IP version used to invite
+/// a neighbour *matters*. If a neighbour is invited with its IPv6,
+/// it will not be able to send messages from its IPv4 because they will be
+/// rejected (and vice versa).
 const IPV6_ONLY: bool = false;
 
 /// Indicates whether uninvited neighbours are allowed
@@ -76,15 +82,15 @@ const MAX_FLOODING_TIMES: u8 = 5;
 
 /// Maximum number of recent data to keep. When this number is exceeded,
 /// the oldest message will have its flooding given up, even if not all
-/// the symmetric neighbours have acknoledged receipt of them.
+/// the symmetric neighbours have acknoledged receipt of it.
 /// Set to 0 to disable the limit.
-const MAX_RECENT_DATA_COUNT: usize = 1;
+const MAX_RECENT_DATA_COUNT: usize = 100;
 
 /// Maximum age of a recent datum (in milliseconds).
 /// Data older than this age will have their flooding given up,
 /// even if not all the symmetric neighbours have acknoledged receipt of them.
 /// Set to 0 to disable the limit.
-const MAX_RECENT_DATA_AGE: u128 = 1;
+const MAX_RECENT_DATA_AGE: u128 = 1_800_000;
 
 /// Interval (in milliseconds) at which to say hello to the active neighbours.
 /// (Set by the subject)
@@ -100,7 +106,7 @@ const MIN_PING_INTERVAL: u128 = 30_000;
 
 /* #endregion */
 
-/// Adds a convenience method to HashMap's entries.
+/// Adds a convenience method to `HashMap`'s entries.
 trait EntryExtension {
     fn is_vacant(&self) -> bool;
 }
@@ -122,7 +128,7 @@ struct ActiveNeighbour<'arena> {
 }
 
 impl<'arena> ActiveNeighbour<'arena> {
-    /// Creates a new ActiveNeighbour for the neighbour with the specified `id`
+    /// Creates a new `ActiveNeighbour` for the neighbour with the specified `id`
     /// and address.
     const fn new(id: PeerID, addr: &'arena Addr) -> Self {
         let never = datetime::never();
@@ -399,9 +405,9 @@ impl<'arena> NeighbourHood<'arena> {
 /// This structure stores information about the status of the
 /// delivery of a determined datum to a neighbour.
 /// This structure does not store information about the datum in question,
-/// but one DeliveryStatus should be used with one and only one datum.
+/// but one `DeliveryStatus` should be used with one and only one datum.
 struct DeliveryStatus<'arena> {
-    /// Weak reference to the ActiveNeighbour object associated with this neighbour.
+    /// Weak reference to the `ActiveNeighbour` object associated with this neighbour.
     /// If the neighbour is marked as inactive and removed from the active neighbours
     /// map before it has acknoledged receipt of the datum,
     /// the weak reference is expected to become invalid, allowing to stop the delivery
@@ -713,7 +719,7 @@ impl<'arena> RecentDataMap<'arena> {
     /// it has at most [`MAX_RECENT_DATA_COUNT`] (\*) items and
     /// contains only data younger than [`MAX_RECENT_DATA_AGE`] (\*).
     /// The data removed have their flooding given up.
-    /// 
+    ///
     /// (*) only if those parameters are non-null.
     fn clean(&mut self) {
         while MAX_RECENT_DATA_COUNT > 0 && self.recent_data.len() > MAX_RECENT_DATA_COUNT {
@@ -723,11 +729,24 @@ impl<'arena> RecentDataMap<'arena> {
                     min = Some((data.msg_id, data.receive_time));
                 }
             }
+            log_warning!(self.socket, "Given up flooding message {0} because the maximum number of recent data has been exceeded.", min.unwrap().0);
+            // min is obviously not None
             self.recent_data.remove(&min.unwrap().0);
         }
 
         if MAX_RECENT_DATA_AGE > 0 {
-            self.recent_data.retain(|_, d| datetime::millis_since(d.receive_time) <= MAX_RECENT_DATA_AGE);
+            let socket = self.socket; // Local binding to avoid using self in closure
+            self.recent_data.retain(|msg_id, d| {
+                if datetime::millis_since(d.receive_time) <= MAX_RECENT_DATA_AGE {
+                    true
+                } else {
+                    log_warning!(
+                        socket,
+                        "Given up flooding message {msg_id} because it was received too long ago."
+                    );
+                    false
+                }
+            });
         }
     }
 }
@@ -765,7 +784,7 @@ impl RemoteError for NeighbourInactive {
 /// Executes the fallible operation given as the second
 /// argument, and logs the error using the logger given as
 /// the first argument if the operation returns an `Err` result.
-/// The error type should implement RemoteError.
+/// The error type should implement `RemoteError`.
 macro_rules! report_on_fail {
     ($logger: expr, $e: expr) => {
         match $e {
@@ -929,7 +948,7 @@ impl<'arena> MircHost<'arena> {
         let mut buffer = Buffer::new(&buf[0..size]);
         Ok((
             addr,
-            MessageParser::try_parse(addr, &mut buffer, &self.logger)?,
+            MessageParser::try_parse(addr, &mut buffer, self.logger)?,
         ))
     }
 }
@@ -1128,7 +1147,7 @@ impl<'arena> LocalUser<'arena> {
 
         // If there are too many messages to receive, the rest will wait.
         // The other routine steps should not stay blocked for too long.
-        for _ in 0..10 {
+        for _ in 0..10i32 {
             match self.receive_message() {
                 Ok(()) => (),
                 Err(ParseError::ReceiveFailed(err))
@@ -1151,7 +1170,7 @@ impl<'arena> LocalUser<'arena> {
                     }
                 }
                 Err(ParseError::UnknownSender(addr)) => {
-                    self.logger.anomaly(ParseError::UnknownSender(addr))
+                    self.logger.anomaly(ParseError::UnknownSender(addr));
                 }
                 Err(err) => self.logger.warning(err),
             }

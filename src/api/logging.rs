@@ -110,11 +110,11 @@ pub struct EventLog {
 }
 
 impl EventLog {
-    /// Creates a new EventLog, that shall log only the events that have at
+    /// Creates a new `EventLog`, that shall log only the events that have at
     /// most verbose level `max_level`.
     pub const fn new(max_level: VerboseLevel) -> Self {
         Self {
-            max_level: max_level,
+            max_level,
             barrier: Mutex::new(()),
         }
     }

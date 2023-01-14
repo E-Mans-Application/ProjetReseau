@@ -4,15 +4,12 @@
 extern crate derive_more;
 extern crate rand;
 
-use rand::distributions::uniform::SampleBorrow;
-
 use self::rand::RngCore;
 
 use self::derive_more::Display;
 use super::addresses::Addr;
 use super::error::{ParseError, ParseResult, SerializationError, SerializationResult};
 use super::parse;
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::rc::Rc;
@@ -31,7 +28,7 @@ pub(super) static EMPTY_BYTE_VEC: Vec<u8> = vec![];
 pub struct PeerID(u64);
 
 impl PeerID {
-    /// Creates a new random ID using the given RngCore.
+    /// Creates a new random ID using the given `RngCore`.
     pub fn new<T: RngCore>(rng: &mut T) -> Self {
         Self(rng.next_u64())
     }
@@ -534,52 +531,3 @@ impl MessageFactory {
 }
 
 /* #endregion */
-
-pub(super) struct LinkedPosition {
-    position: u8,
-    previous: Option<Rc<RefCell<LinkedPosition>>>,
-    next: Option<Rc<RefCell<LinkedPosition>>>,
-}
-
-impl LinkedPosition {
-    pub const fn new() -> Self {
-        Self { position: 0, previous: None, next: None }
-    }
-
-    fn recurse<F>(&mut self, mut f: F) where F : FnMut(&mut LinkedPosition) {
-        f(self);
-        if let Some(next) = &self.next {
-            next.borrow_mut().recurse(f);
-        }
-    }
-
-    fn increase(&mut self) {
-        self.recurse(|p| p.position += 1);
-    }
-    fn decrease(&mut self) {
-        self.recurse(|p| p.position -= 1);
-    }
-
-    pub fn make_room(who: Rc<RefCell<LinkedPosition>>) -> Rc<RefCell<Self>> {
-        let mut borrow = who.borrow_mut();
-        borrow.increase();
-
-        let previous = Rc::new(RefCell::new(Self { position: 0, previous: None, next: None }));
-        borrow.previous = Some(Rc::clone(&previous));        
-        drop(borrow);
-
-        previous.borrow_mut().next = Some(who);
-        previous
-    }
-
-    pub fn withdraw(self) {
-        if let Some(previous) = &self.previous {
-            previous.borrow_mut().next = self.next.as_ref().map(Rc::clone);
-        }
-        if let Some(next) = &self.next {
-            let mut next = next.borrow_mut();
-            next.previous = self.previous;
-            next.decrease();
-        }
-    }
-}
