@@ -8,22 +8,38 @@ use super::addresses::Addr;
 use self::derive_more::{Display, From};
 use std::error::Error;
 
+#[derive(Display, Debug)]
+pub(super) enum LimitedStringError {
+    StringTooLarge,
+    InvalidUtf8String(std::str::Utf8Error),
+}
+
+impl Error for LimitedStringError {}
+
+#[derive(Display, Debug)]
+pub(super) enum ViolationKind {
+    /// The datagram does not start by the [`super::util::PROTOCOL_MAGIC`] byte.
+    NotAMircDatagram,
+    /// The datagram specifies a protocol version different from
+    /// [`super::util::PROTOCOL_VERSION`]
+    UnsupportedProtocolVersion(u8),
+    /// The datagram is less than 4-byte-long, or its body is shorter than
+    /// the size specified in the header.
+    InvalidLength,
+    /// The body of the datagram is not a valid sequence of TLVs.
+    /// ### Note:
+    /// The whole datagram is discarded, even if this error occurs after some TLVs
+    /// have been parsed successfully.
+    InvalidSequenceOfTlv,
+}
+
 /// Errors that may occur when a message is parsed.
 #[derive(Display, Debug)]
 pub(super) enum ParseError {
     #[display(fmt = "Cannot receive a datagram from UDP socket: {_0}")]
     ReceiveFailed(std::io::Error),
-    #[display(fmt = "Received UDP datagram is not a MIRC service data unit")]
-    NotAMircDatagram,
-    #[display(fmt = "Received MIRC message uses an unsupported protocol version")]
-    UnsupportedProtocolVersion(u8),
-    #[display(fmt = "Invalid UTF-8 string: {_0}")]
-    InvalidUtf8String(std::str::Utf8Error),
-    // StringTooLarge is here for convenience reasons, but it may actually not
-    // occur when parsing a message because of the maximum length of a TLV (255 bytes)
-    StringTooLarge,
-    #[display(fmt = "Protocol violation from {_0}")]
-    ProtocolViolation(Addr),
+    #[display(fmt = "Protocol violation from {_0}: {_1}")]
+    ProtocolViolation(Addr, ViolationKind),
     #[display(
         fmt = "Message received from uninvited third party: {_0} (Message ignored according to security rules.)"
     )]
@@ -45,19 +61,15 @@ impl Error for ParseError {
     }
 }
 
-// Actually, this error should never happen because:
-// - The program should never try to send unsupported tags (tags Unrecognized or Illegal);
-// - The program uses constant-size messages in warnings and go-away TLVs, and splits data sent
-// from the user in several TLVs if needed.
-/// Errors that may occur when serializing data to send into bytes
-/// (It is the reverse of `ParseError`.)
+/// Error that occurs when trying to serialize an
+/// unsupported tag (such as [`super::util::TagLengthValue::Unrecognized`],
+/// or a "Warning" with an invalid UTF-8 message)
+///
+/// This error should never occur in practice.
 #[derive(Display, Debug)]
-pub(super) enum SerializationError {
-    UnsupportedTag,
-    StringTooLarge(String),
-}
+pub(super) struct UnsupportedTag;
 
-impl Error for SerializationError {}
+impl Error for UnsupportedTag {}
 
 /// Error that is returned by functions that give up
 /// if the neighbour has been inactive for too long.
@@ -67,7 +79,7 @@ pub(super) struct NeighbourInactive;
 impl Error for NeighbourInactive {}
 
 /// Error that may occur when using the ready-to-use function
-/// `crate::api::use_client`.
+/// [`crate::api::use_client`].
 #[derive(From, Debug)]
 pub enum UseClientError {
     PanicError(Box<dyn std::any::Any + Send + 'static>),
@@ -76,5 +88,4 @@ pub enum UseClientError {
 }
 
 pub(super) type ParseResult<R> = std::result::Result<R, ParseError>;
-pub(super) type SerializationResult<R> = std::result::Result<R, SerializationError>;
 pub(super) type InactivityResult<R> = std::result::Result<R, NeighbourInactive>;

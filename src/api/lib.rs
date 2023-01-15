@@ -16,16 +16,13 @@ use std::{
 
 use super::{
     addresses::Addr,
-    datetime::{self, DateTime},
+    datetime::{DateTime, Duration, MillisType},
     error::{InactivityResult, NeighbourInactive, ParseError, ParseResult},
     logging::EventLog,
-    parse::MessageParser,
+    parse::{Buffer, MessageParser},
     util::{Data, GoAwayReason, LimitedString, MessageFactory, MessageId, PeerID, TagLengthValue},
 };
-use crate::{
-    api::parse::Buffer, lazy_format, log_anomaly, log_debug, log_important, log_info, log_trace,
-    log_warning,
-};
+use crate::{lazy_format, log_anomaly, log_debug, log_important, log_info, log_trace, log_warning};
 
 /* #region PARAMETERS */
 
@@ -38,7 +35,7 @@ use crate::{
 /// able to send and receive messages to/from IPv4-mapped addresses.
 /// In this case, the address of the first neighbour must be a genuine
 /// IPv6 address.
-/// 
+///
 /// ### Note on invitations:
 /// If [`ALLOW_SELF_INVITATION`] is `false`, then the IP version used to invite
 /// a neighbour *matters*. If a neighbour is invited with its IPv6,
@@ -69,11 +66,11 @@ const MIN_DESIRED_SYMMETRIC: usize = 1; //TODO
 
 /// Delay (in milliseconds) after which a neighbour is marked as inactive
 /// if it does not say hello. (Set by the subject)
-const ACTIVITY_TIMEOUT: u128 = 120_000;
+const ACTIVITY_TIMEOUT: MillisType = 120_000;
 
 /// Delay (in milliseconds) after which a neighbour is marked as non-symmetric
 /// if it does not send a long hello. (Set by the subject)
-const SYMMETRY_TIMEOUT: u128 = 120_000;
+const SYMMETRY_TIMEOUT: MillisType = 120_000;
 
 /// Number of times a "Data" TLV should be sent to a neighbour
 /// before the neighbour is considered as inactive (unless it
@@ -90,19 +87,19 @@ const MAX_RECENT_DATA_COUNT: usize = 100;
 /// Data older than this age will have their flooding given up,
 /// even if not all the symmetric neighbours have acknoledged receipt of them.
 /// Set to 0 to disable the limit.
-const MAX_RECENT_DATA_AGE: u128 = 1_800_000;
+const MAX_RECENT_DATA_AGE: MillisType = 1_800_000;
 
 /// Interval (in milliseconds) at which to say hello to the active neighbours.
 /// (Set by the subject)
-const HELLO_INTERVAL: u128 = 30_000;
+const HELLO_INTERVAL: MillisType = 30_000;
 
 /// Interval (in milliseconds) at which to send the list of symmetric neighbours
 /// to all the active neighbours.
-const NEIGHBOURHOOD_BROADCAST_INTERVAL: u128 = 30_000;
+const NEIGHBOURHOOD_BROADCAST_INTERVAL: MillisType = 30_000;
 
 /// The minimum interval (in milliseconds) between two "pings" to the potential neighbours.
 /// (A ping is the operation performed when [`MIN_DESIRED_SYMMETRIC`] is not respected.)
-const MIN_PING_INTERVAL: u128 = 30_000;
+const MIN_PING_INTERVAL: MillisType = 30_000;
 
 /* #endregion */
 
@@ -131,7 +128,7 @@ impl<'arena> ActiveNeighbour<'arena> {
     /// Creates a new `ActiveNeighbour` for the neighbour with the specified `id`
     /// and address.
     const fn new(id: PeerID, addr: &'arena Addr) -> Self {
-        let never = datetime::never();
+        let never = DateTime::never();
         Self {
             id,
             addr,
@@ -141,7 +138,7 @@ impl<'arena> ActiveNeighbour<'arena> {
     }
 
     fn is_symmetric(&self) -> bool {
-        datetime::millis_since(self.last_long_hello) < SYMMETRY_TIMEOUT
+        DateTime::now().millis_since(self.last_long_hello) < SYMMETRY_TIMEOUT
     }
 
     /// Sends a Hello TLV to the neighbour.
@@ -151,7 +148,7 @@ impl<'arena> ActiveNeighbour<'arena> {
     /// If the neighbour has not said hello for more than [`ACTIVITY_TIMEOUT`] milliseconds,
     /// the operation is aborted and this function returns `Err(NeighbourInactive)`.
     fn say_hello(&self, local_id: PeerID, socket: &MircHost<'arena>) -> InactivityResult<()> {
-        if datetime::millis_since(self.last_hello) > ACTIVITY_TIMEOUT {
+        if DateTime::now().millis_since(self.last_hello) > ACTIVITY_TIMEOUT {
             Err(NeighbourInactive)
         } else {
             let hello = TagLengthValue::Hello(local_id, Some(self.id));
@@ -167,6 +164,7 @@ struct NeighbourHood<'arena> {
     socket: &'arena MircHost<'arena>,
     tvp: HashSet<&'arena Addr>,
     tva: HashMap<&'arena Addr, Rc<RefCell<ActiveNeighbour<'arena>>>>,
+    blocked: HashMap<&'arena Addr, (u32, DateTime)>,
     last_broadcast: DateTime,
     last_greetings: DateTime,
     last_ping: DateTime,
@@ -187,22 +185,29 @@ impl<'arena> NeighbourHood<'arena> {
             socket,
             tvp: HashSet::new(),
             tva: HashMap::new(),
-            last_broadcast: datetime::now(),
-            last_greetings: datetime::never(),
-            last_ping: datetime::never(),
+            blocked: HashMap::new(),
+            last_broadcast: DateTime::now(),
+            last_greetings: DateTime::never(),
+            last_ping: DateTime::never(),
         }
     }
 
     /// Welcomes a new neighbour, and adds it to the potential neighbours map.
     /// `addr` is the address of the neighbour.
-    /// `authorize` indicates whether the neighbour has been explictly invited (either
-    ///  by the user that started the program, or by an invited neighbour).
+    /// `authorized` indicates whether the neighbour has been explictly invited (either
+    ///  by the user who started the program, or by an invited neighbour).
     /// Returns a `Some` value containing a long-lasting reference to the address of the
     /// neighbour if it is authorized to join the neighbourhood, and `None` otherwise.
     /// # Note:
     /// If [`ALLOW_SELF_INVITATION`] is true, the argument `authorized` is ignored and
-    /// this function never returns `None`.
+    /// this function only returns `None` if the neighbour has been explicitly blocked.
     fn welcome(&mut self, addr: Addr, authorized: bool) -> Option<&'arena Addr> {
+        if let Some((_, until)) = self.blocked.get(&addr) {
+            if DateTime::now().millis_since(*until) <= 0 {
+                return None;
+            }
+        }
+
         if let Some(registered) = self.tvp.get(&addr) {
             Some(*registered)
         } else if ALLOW_SELF_INVITATION || authorized {
@@ -230,7 +235,7 @@ impl<'arena> NeighbourHood<'arena> {
 
         let neighbour =
             neighbour.or_insert_with(|| Rc::new(RefCell::new(ActiveNeighbour::new(id, addr))));
-        neighbour.borrow_mut().last_hello = datetime::now();
+        neighbour.borrow_mut().last_hello = DateTime::now();
         (new, neighbour)
     }
 
@@ -251,10 +256,7 @@ impl<'arena> NeighbourHood<'arena> {
 
     /// Convenience method to create a "GoAway" TLV with the specified `reason` and `msg`.
     fn create_go_away_tlv(reason: GoAwayReason, msg: Option<String>) -> TagLengthValue {
-        TagLengthValue::GoAway(
-            reason,
-            msg.map(|m| LimitedString::try_from(m).map_err(|_err| ParseError::StringTooLarge)),
-        )
+        TagLengthValue::GoAway(reason, msg.map(LimitedString::try_from))
     }
 
     /// Dismisses all the neighbours contained in the array `who`.
@@ -272,10 +274,48 @@ impl<'arena> NeighbourHood<'arena> {
         }
     }
 
+    /// Blocks the neighbour for the specified duration, preventing it from sending
+    /// messages. This neighbour will no longer receive "pings" while it is blocked.
+    /// A "GoAway" TLV with code "ProtocolViolation" and the specified message is also
+    /// sent to the neighbour.
+    ///
+    /// If the neighbour has already been blocked recently, the duration is increased
+    /// in order to punish spamming more severely.
+    /// The function used to increase the duration is unspecified (see the implementation).
+    fn block(&mut self, who: &'arena Addr, mut duration: Duration, msg: Option<String>) {
+        let mut count = 1; // Number of unpardoned blockings
+
+        if let Some((mut c, unblocked)) = self.blocked.get(who) {
+            let unblocked_for = DateTime::now().millis_since(*unblocked);
+            if unblocked_for > 0 {
+                // Pardon 1 blocking per 20 seconds once the neighbour is unblocked (arbitrary)
+                let pardon_count = unblocked_for / 20_000;
+                if pardon_count <= c.into() {
+                    c -= pardon_count as u32; // cannot overflow
+                }
+            }
+            count = c + 1;
+            // Exponential function
+            duration = duration.checked_mul(Duration::from_millis(1i64 << std::cmp::min(62, c)));
+        }
+
+        let new_unblock = DateTime::now().checked_add(duration);
+
+        self.blocked.insert(who, (count, new_unblock));
+        self.dismiss(&[who], GoAwayReason::ProtocolViolation, msg);
+
+        log_important!(
+            self.socket,
+            "Neighbour {} blocked until {} because of protocol violations.",
+            who,
+            new_unblock.formatted()
+        );
+    }
+
     /// Indicates whether it is timely to greet (i.e. say hello) to the
     /// active neighbours.
     fn should_greet(&self) -> bool {
-        datetime::millis_since(self.last_greetings) > HELLO_INTERVAL
+        DateTime::now().millis_since(self.last_greetings) > HELLO_INTERVAL
     }
 
     /// Says hello to all the active neighbours.
@@ -290,7 +330,7 @@ impl<'arena> NeighbourHood<'arena> {
                 inactives.push(*addr);
             }
         }
-        self.last_greetings = datetime::now();
+        self.last_greetings = DateTime::now();
 
         self.dismiss(
             &inactives,
@@ -302,7 +342,7 @@ impl<'arena> NeighbourHood<'arena> {
     /// Indicates whether it is timely to broadcast the list of the symmetric neighbours
     /// to all the active neighbours.
     fn should_broadcast(&self) -> bool {
-        datetime::millis_since(self.last_broadcast) > NEIGHBOURHOOD_BROADCAST_INTERVAL
+        DateTime::now().millis_since(self.last_broadcast) > NEIGHBOURHOOD_BROADCAST_INTERVAL
     }
 
     /// Broadcasts the list of the symmetric neighbours
@@ -319,14 +359,14 @@ impl<'arena> NeighbourHood<'arena> {
             neighbours.push(*addr);
         }
         self.socket.send_many_tlvs(&neighbours, &msg);
-        self.last_broadcast = datetime::now();
+        self.last_broadcast = DateTime::now();
     }
 
     /// Indicates whether it is timely and relevant to look for new friends by pinging
     /// all the potential (and non-symmetric) neighbours.
     fn should_ping(&self) -> bool {
         self.count_symmetrics() < MIN_DESIRED_SYMMETRIC
-            && datetime::millis_since(self.last_ping) > MIN_PING_INTERVAL
+            && DateTime::now().millis_since(self.last_ping) > MIN_PING_INTERVAL
     }
 
     /// Looks for new friends by sending a Hello TLV to all the potential
@@ -335,11 +375,11 @@ impl<'arena> NeighbourHood<'arena> {
         let tlv = Rc::new(TagLengthValue::Hello(local_id, None));
 
         for addr in &self.tvp {
-            if !self.is_symmetric(addr) {
+            if !self.is_symmetric(addr) && !self.blocked.contains_key(addr) {
                 self.socket.send_single_tlv(addr, Rc::clone(&tlv));
             }
         }
-        self.last_ping = datetime::now();
+        self.last_ping = DateTime::now();
     }
 
     /// Acknoledges receipt of a message. An "Ack" TLV is sent to all the symmetric
@@ -415,7 +455,7 @@ struct DeliveryStatus<'arena> {
     neighbour: Weak<RefCell<ActiveNeighbour<'arena>>>,
     flooding_times: u8,
     last_flooding: DateTime,
-    next_flooding_delay: u128,
+    next_flooding_delay: MillisType,
 }
 
 impl<'arena> DeliveryStatus<'arena> {
@@ -443,7 +483,7 @@ impl<'arena> DeliveryStatus<'arena> {
 
     /// Indicates whether it is timely to undertake a new delivery attempt to this neighbour.
     fn should_flood(&self) -> bool {
-        datetime::millis_since(self.last_flooding) > self.next_flooding_delay
+        DateTime::now().millis_since(self.last_flooding) > self.next_flooding_delay
     }
 
     /// Sends the datum to this neighbour and updates the delivery status.
@@ -477,13 +517,13 @@ impl<'arena> DeliveryStatus<'arena> {
     /// Internal use only (should be called only by `flood`).
     fn flooded(&mut self, rng: &mut StdRng) {
         self.flooding_times += 1;
-        self.last_flooding = datetime::now();
+        self.last_flooding = DateTime::now();
         self.next_flooding_delay = self.random_flooding_delay(rng);
     }
 
     /// Chooses a random delay for the next delivery attempt.
     /// Internal use only.
-    fn random_flooding_delay(&self, rng: &mut StdRng) -> u128 {
+    fn random_flooding_delay(&self, rng: &mut StdRng) -> MillisType {
         if self.flooding_times == 0 {
             rng.gen_range(500..1000)
         } else {
@@ -530,7 +570,7 @@ impl<'arena> RecentDatum<'arena> {
         rng: &mut StdRng,
         socket: &'arena MircHost<'arena>,
     ) -> Self {
-        let date_now = datetime::now();
+        let date_now = DateTime::now();
 
         let mut neighbours_to_flood = HashMap::new();
         neighbours.for_each(|addr, neighbour| {
@@ -737,7 +777,7 @@ impl<'arena> RecentDataMap<'arena> {
         if MAX_RECENT_DATA_AGE > 0 {
             let socket = self.socket; // Local binding to avoid using self in closure
             self.recent_data.retain(|msg_id, d| {
-                if datetime::millis_since(d.receive_time) <= MAX_RECENT_DATA_AGE {
+                if DateTime::now().millis_since(d.receive_time) <= MAX_RECENT_DATA_AGE {
                     true
                 } else {
                     log_warning!(
@@ -875,13 +915,6 @@ impl<'arena> MircHost<'arena> {
         }
     }
 
-    /// Cancels the delivery of all the awaiting messages.
-    fn cancel_all(&self) {
-        for queue in self.buffer.borrow_mut().values_mut() {
-            queue.clear();
-        }
-    }
-
     /// Calls the closure on the message queue associated with the specified neighbour.
     /// Internal use only. Wrong usage may cause dead locks because this function mutably
     /// borrows the buffer, and the buffer is still mutably borrowed when the closure is called.
@@ -948,7 +981,8 @@ impl<'arena> MircHost<'arena> {
         let mut buffer = Buffer::new(&buf[0..size]);
         Ok((
             addr,
-            MessageParser::try_parse(addr, &mut buffer, self.logger)?,
+            MessageParser::try_parse(&mut buffer)
+                .map_err(|kind| ParseError::ProtocolViolation(addr.clone(), kind))?,
         ))
     }
 }
@@ -1007,14 +1041,31 @@ impl<'arena> LocalUser<'arena> {
     /// error is logged by the logger.
     fn warn(&self, addr: &'arena Addr, msg: String) {
         let msg = LimitedString::try_from(msg);
-        match msg {
-            Err(err) => self.logger.error(lazy_format!(
-                "Invalid message used in a 'warning' TLV: {err}"
-            )),
-            Ok(msg) => {
-                let tlv = Rc::new(TagLengthValue::Warning(msg));
-                self.socket.send_single_tlv(addr, Rc::clone(&tlv));
-            }
+        let tlv = Rc::new(TagLengthValue::Warning(msg));
+        self.socket.send_single_tlv(addr, Rc::clone(&tlv));
+    }
+
+    /// Shows a new datum to the user. This function behaves differently depending
+    /// on whether or not the datum is a UTF-8 byte sequence.
+    fn report_new_data(&self, sender: &'arena Addr, msg_id: MessageId, data: &Data) {
+        if let Some(str) = data.to_string() {
+            log_info!(
+                self,
+                "Received new data (id: {0}) from {1}: {2}",
+                &msg_id,
+                sender,
+                str
+            );
+            report_on_fail!(self.logger, std::io::stdout().lock().write(str.as_bytes()));
+            report_on_fail!(self.logger, std::io::stdout().lock().write(b"\n"));
+        } else {
+            log_info!(
+                self,
+                "Received non-UTF-8 data (id: {0} from {1}: {2:?}",
+                &msg_id,
+                sender,
+                data.as_bytes(),
+            );
         }
     }
 
@@ -1051,30 +1102,22 @@ impl<'arena> LocalUser<'arena> {
                 // Only data sent from symmetric neighbours are accepted
                 if self.neighbours.borrow().is_symmetric(sender) {
                     if self.data.insert_data(msg_id, data.clone(), &mut self.rng) {
-                        // `insert_data` returns true if it is a new data
-                        log_info!(
-                            self,
-                            "Received new data (id: {0}) from {1}: {2}",
-                            &msg_id,
-                            sender,
-                            &data
-                        );
-                        report_on_fail!(
-                            self.logger,
-                            std::io::stdout().lock().write(data.as_bytes())
-                        );
-                        report_on_fail!(self.logger, std::io::stdout().lock().write(b"\n"));
+                        // `insert_data` returns true if it is a new datum
+                        self.report_new_data(sender, msg_id, &data);
                     }
                     self.data.process_ack(sender, &msg_id);
                     self.neighbours.borrow().acknoledge(msg_id);
                 } else {
-                    self.warn(
+                    self.neighbours.borrow_mut().block(
                         sender,
-                        "Protocol violation: Please say hello before \
-                            flooding data. Your message has been ignored. \
-                            This could be more severely punished in a future version."
-                            .to_owned(),
+                        Duration::from_millis(500),
+                        Some(
+                            "Please say hello before \
+                            flooding data. Your message has been ignored"
+                                .to_owned(),
+                        ),
                     );
+
                     log_anomaly!(
                         self,
                         "Data flooded by non symmetric neighbour {sender} have been discarded."
@@ -1105,27 +1148,25 @@ impl<'arena> LocalUser<'arena> {
             }
 
             TagLengthValue::Warning(msg) => {
-                log_warning!(self, "Warning sent from: {sender}:\n{msg}");
+                if let Ok(msg) = msg {
+                    log_warning!(self, "Warning sent from {sender}: {msg}");
+                } else {
+                    self.warn(
+                        sender,
+                        "Warnings should contain a UTF-8 message.".to_owned(),
+                    );
+                    log_warning!(
+                        self,
+                        "Warning sent from {sender} with an invalid UTF-8 message."
+                    );
+                }
             }
 
-            TagLengthValue::Unrecognized(tag, _) => {
+            TagLengthValue::Unrecognized(tag) => {
                 self.warn(sender, format!("Unrecognized tag {tag} was ignored."));
                 log_anomaly!(self, "Unrecognized tag {tag} received from {sender}");
             }
 
-            TagLengthValue::Illegal(tag, err) => {
-                self.warn(
-                    sender,
-                    format!("Tag {tag} had illegal content and was ignored."),
-                );
-                log_warning!(
-                    self,
-                    "Tag {0} was received from {1} with illegal content:\n{2}",
-                    tag,
-                    sender,
-                    err
-                );
-            }
             _ => {}
         }
     }
@@ -1147,7 +1188,7 @@ impl<'arena> LocalUser<'arena> {
 
         // If there are too many messages to receive, the rest will wait.
         // The other routine steps should not stay blocked for too long.
-        for _ in 0..10i32 {
+        for _ in 0u8..10u8 {
             match self.receive_message() {
                 Ok(()) => (),
                 Err(ParseError::ReceiveFailed(err))
@@ -1159,20 +1200,21 @@ impl<'arena> LocalUser<'arena> {
                     self.logger.debug(err);
                 }
                 Err(ParseError::ReceiveFailed(err)) => self.logger.information(err),
-                Err(ParseError::ProtocolViolation(from)) => {
-                    if let Some(addr) = self.neighbours.borrow_mut().welcome(from, false) {
-                        self.warn(
+                Err(ParseError::ProtocolViolation(from, kind)) => {
+                    self.logger
+                        .anomaly(ParseError::ProtocolViolation(from.clone(), kind));
+                    let mut neighbours = self.neighbours.borrow_mut();
+                    if let Some(addr) = neighbours.welcome(from, false) {
+                        neighbours.block(
                             addr,
-                            "Protocol violation (no further information). Please abide by the rules. \
-                        This could be more severely punished in a future version."
-                                .to_owned(),
+                            Duration::from_millis(500),
+                            Some("I can break rules, too.".to_owned()),
                         );
                     }
                 }
                 Err(ParseError::UnknownSender(addr)) => {
                     self.logger.anomaly(ParseError::UnknownSender(addr));
                 }
-                Err(err) => self.logger.warning(err),
             }
         }
     }
@@ -1195,15 +1237,13 @@ impl<'arena> LocalUser<'arena> {
         Ok(())
     }
 
-    /// Cancels the delivery of all the awaiting messages and notifies all the
-    /// active neighbours that this user is leaving.
+    /// Notifies all the active neighbours that this user is leaving.
     /// (Sends a "GoAway" TLV with code "EmitterLeaving", and flushes the socket's buffer).
     ///
     /// Note: this function does nothing else. This object may still be used until
     /// it is dropped.
     pub fn shutdown(&self) {
         log_important!(self, "Shutting down...");
-        self.socket.cancel_all();
         let tlv = Rc::new(NeighbourHood::create_go_away_tlv(
             GoAwayReason::EmitterLeaving,
             Some("Good bye!".to_owned()),

@@ -4,13 +4,14 @@
 
 use std::convert::TryFrom;
 use std::fmt::{Debug, Display};
+use std::hash::Hash;
 use std::net::{self, IpAddr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 
 use super::parse::Buffer;
 
 /// An opaque wrapper representing an Ipv6 address.
-#[derive(Eq, Hash, Debug, Clone)]
+#[derive(Eq, Debug, Clone)]
 pub struct Addr {
     addr: net::Ipv6Addr,
     port: u16,
@@ -25,6 +26,18 @@ impl PartialEq for Addr {
                 || (other.addr == net::Ipv6Addr::UNSPECIFIED
                     && self.addr == net::Ipv6Addr::LOCALHOST)
                 || self.addr == other.addr)
+    }
+}
+
+impl Hash for Addr {
+    // Explicit impl because PartialEq is explicitly impl too.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if self.addr.is_unspecified() {
+            net::Ipv6Addr::LOCALHOST.hash(state);
+        } else {
+            self.addr.hash(state);
+        }
+        self.port.hash(state);
     }
 }
 

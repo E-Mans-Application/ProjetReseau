@@ -8,7 +8,7 @@ use self::rand::RngCore;
 
 use self::derive_more::Display;
 use super::addresses::Addr;
-use super::error::{ParseError, ParseResult, SerializationError, SerializationResult};
+use super::error::{LimitedStringError, UnsupportedTag};
 use super::parse;
 use std::collections::VecDeque;
 use std::convert::TryFrom;
@@ -85,24 +85,24 @@ impl From<(PeerID, u32)> for MessageId {
 pub(super) struct LimitedString<const S: usize>(String);
 
 impl<const S: usize> TryFrom<String> for LimitedString<S> {
-    type Error = SerializationError;
+    type Error = LimitedStringError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         if value.len() > S {
-            Err(SerializationError::StringTooLarge(value))
+            Err(LimitedStringError::StringTooLarge)
         } else {
             Ok(Self(value))
         }
     }
 }
 impl<const S: usize> TryFrom<&[u8]> for LimitedString<S> {
-    type Error = ParseError;
+    type Error = LimitedStringError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() > S {
-            Err(ParseError::StringTooLarge)
+            Err(LimitedStringError::StringTooLarge)
         } else {
-            let str = std::str::from_utf8(value).map_err(ParseError::InvalidUtf8String)?;
+            let str = std::str::from_utf8(value).map_err(LimitedStringError::InvalidUtf8String)?;
             Ok(Self(str.to_owned()))
         }
     }
@@ -113,19 +113,73 @@ impl<const S: usize> LimitedString<S> {
         self.0.len()
     }
 
-    /// Divides a string value in multiple `LimitedString`s,
-    /// such as all `LimitedString`s contain a valid UTF-8 string,
-    /// and the concatenation of the `LimitedString`s is the
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// Creates a `LimitedString` from the specified string, assuming it
+    /// is less than `S`-byte long.
+    /// ### Safety:
+    /// The value given must be such that `value.len() <= S`.
+    /// ### Note:
+    /// This internal function avoids unnecessary wrapping and unwrapping if the size
+    /// of the `value` has already been checked. It is not intended for general use.
+    unsafe fn from_str_unchecked(value: &str) -> LimitedString<S> {
+        Self(value.to_owned())
+    }
+}
+
+/* #endregion */
+
+/* #region Data */
+
+const DATA_MAX_SIZE: usize = 235;
+
+#[derive(Debug, Clone)]
+pub(super) struct Data(Result<LimitedString<DATA_MAX_SIZE>, Vec<u8>>);
+
+impl TryFrom<&[u8]> for Data {
+    type Error = LimitedStringError;
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        match LimitedString::try_from(value) {
+            Ok(msg) => Ok(Data(Ok(msg))),
+            Err(LimitedStringError::InvalidUtf8String(_)) => Ok(Data(Err(value.to_owned()))),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl Data {
+    pub fn len_in_bytes(&self) -> usize {
+        match &self.0 {
+            Ok(msg) => msg.len_in_bytes(),
+            Err(raw) => raw.len(),
+        }
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        match &self.0 {
+            Ok(msg) => msg.as_bytes(),
+            Err(raw) => raw.as_slice(),
+        }
+    }
+    pub fn to_string(&self) -> Option<&LimitedString<235>> {
+        match &self.0 {
+            Ok(msg) => Some(msg),
+            Err(_) => None,
+        }
+    }
+
+    /// Divides a string value in multiple `Data`s,
+    /// such as all `Data`s contain a valid UTF-8 string,
+    /// and the concatenation of the `Data`s is the
     /// initial value.
-    ///
-    /// This function cannot be called if S = 0.
     pub fn pack(value: &str) -> Vec<Self> {
-        assert!(S != 0);
         if value.is_empty() {
             return vec![];
         }
-        if value.len() <= S {
-            return vec![Self(value.to_owned())];
+        if value.len() <= DATA_MAX_SIZE {
+            // Safety: value.len() <= DATA_MAX_SIZE
+            return vec![unsafe { Self(Ok(LimitedString::from_str_unchecked(value))) }];
         }
 
         let mut vec = vec![];
@@ -133,24 +187,18 @@ impl<const S: usize> LimitedString<S> {
         let mut str = String::new();
 
         for c in value.chars() {
-            if str.len() + c.len_utf8() <= S {
+            if str.len() + c.len_utf8() <= DATA_MAX_SIZE {
                 str.push(c);
             } else {
-                vec.push(Self(str));
+                // Safety: str.len() <= DATA_MAX_SIZE is an invariant.
+                vec.push(unsafe { Self(Ok(LimitedString::from_str_unchecked(&str))) });
                 str = String::from(c);
             }
         }
 
         vec
     }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
 }
-
-/// A specific alias for data sent in the TLVs 'Data'.
-pub(super) type Data = LimitedString<235>;
 
 /* #endregion */
 
@@ -206,24 +254,25 @@ pub(super) enum TagLengthValue {
     PadN(usize),
     Hello(PeerID, Option<PeerID>),
     Neighbour(Addr),
+    // Note: currently, only UTF-8 data can be sent.
+    // Non UTF-8 data can be received without triggering a protocol violation,
+    // but they will be ignored.
     Data(MessageId, Data),
     Ack(MessageId),
     // None => no message specified
     // Some(Err(_)) => invalid UTF-8 message specified
     // Some(Ok(_)) => self-explanatory
-    GoAway(GoAwayReason, Option<ParseResult<LimitedString<254>>>),
-    Warning(LimitedString<255>),
-    /// A special value for received TLVs that have not been recognized.
-    /// Contains the raw tag id and the raw value of the TLV.
+    GoAway(
+        GoAwayReason,
+        Option<Result<LimitedString<254>, LimitedStringError>>,
+    ),
+    Warning(Result<LimitedString<255>, LimitedStringError>),
+    /// A special value for TLVs that have not been recognized.
+    /// Contains the raw tag id of the TLV. The content is discarded because it
+    /// would not be used anyway.
+    ///
     /// This TLV cannot be sent.
-    Unrecognized(u8, Vec<u8>),
-    /// A special value for received TLVs that were recognized but ill-formed.
-    /// This TLV cannot be sent.
-    /// This TLV is used only if the ill-formed TLV has an appropriate structure but contains
-    /// data that cannot be interpreted.
-    /// A parse error that leaves the buffer in an inconsistent state
-    /// will more likely cause [` try_parse `] to return None.
-    Illegal(u8, ParseError),
+    Unrecognized(u8),
 }
 
 impl TagLengthValue {
@@ -256,11 +305,7 @@ impl TagLengthValue {
         let mut buffer = buffer.extract(length)?;
 
         match tag {
-            TagLengthValue::TAG_ID_PADN => {
-                buffer.try_take(length)?;
-                buffer.ensure_empty()?;
-                Some(TagLengthValue::PadN(length))
-            }
+            TagLengthValue::TAG_ID_PADN => Some(TagLengthValue::PadN(length)),
 
             TagLengthValue::TAG_ID_HELLO => {
                 let sender_id = PeerID::try_parse(&mut buffer)?;
@@ -281,11 +326,7 @@ impl TagLengthValue {
                 if tag == TagLengthValue::TAG_ID_DATA {
                     match Data::try_from(buffer.read_to_end()) {
                         Ok(data) => Some(TagLengthValue::Data(msg_id, data)),
-                        Err(ParseError::InvalidUtf8String(err)) => Some(TagLengthValue::Illegal(
-                            tag,
-                            ParseError::InvalidUtf8String(err),
-                        )),
-                        Err(_) => None,
+                        Err(_) => None, // unreachable
                     }
                 } else {
                     // ACK
@@ -305,15 +346,10 @@ impl TagLengthValue {
 
             TagLengthValue::TAG_ID_WARNING => {
                 let msg = LimitedString::try_from(buffer.read_to_end());
-                msg.map_or_else(
-                    |err| Some(TagLengthValue::Illegal(tag, err)),
-                    |str| Some(TagLengthValue::Warning(str)),
-                )
+                Some(TagLengthValue::Warning(msg))
             }
-            id => {
-                let data = buffer.read_to_end();
-                Some(TagLengthValue::Unrecognized(id, data.to_vec()))
-            }
+
+            id => Some(TagLengthValue::Unrecognized(id)),
         }
     }
 
@@ -347,12 +383,18 @@ impl TagLengthValue {
                 Self::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES + msg.len_in_bytes()
             }
             Self::GoAway(_, _) => Self::HEADER_SIZE + GoAwayReason::LENGTH_IN_BYTES,
-            Self::Warning(msg) => Self::HEADER_SIZE + msg.len_in_bytes(),
+            Self::Warning(msg) => {
+                Self::HEADER_SIZE
+                    + msg
+                        .as_ref()
+                        .map(LimitedString::len_in_bytes)
+                        .unwrap_or_default()
+            }
             _ => 0,
         }
     }
 
-    pub fn try_to_bytes(&self) -> SerializationResult<Vec<u8>> {
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, UnsupportedTag> {
         match self {
             TagLengthValue::Pad1 => Ok(vec![TagLengthValue::TAG_ID_PAD1]),
 
@@ -408,7 +450,10 @@ impl TagLengthValue {
             }
 
             TagLengthValue::Warning(msg) => {
-                let msg_bytes = msg.as_bytes();
+                let msg_bytes = msg
+                    .as_ref()
+                    .map(LimitedString::as_bytes)
+                    .map_err(|_err| UnsupportedTag)?;
 
                 let mut bytes = vec![
                     TagLengthValue::TAG_ID_WARNING,
@@ -419,7 +464,7 @@ impl TagLengthValue {
                 Ok(bytes)
             }
 
-            _ => Err(SerializationError::UnsupportedTag),
+            _ => Err(UnsupportedTag),
         }
     }
 }
@@ -522,11 +567,6 @@ impl MessageFactory {
         vec[3] = size[1];
 
         Some(vec)
-    }
-
-    /// Clears the queue, discarding all the enqueued TLVs.
-    pub fn clear(&mut self) {
-        self.buffer.clear();
     }
 }
 

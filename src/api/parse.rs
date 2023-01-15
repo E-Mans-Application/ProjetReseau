@@ -2,11 +2,7 @@
 //! UDP datagrams.
 //! An important part of the work is done by `TagLengthValue` in `util`.
 
-use crate::lazy_format;
-
-use super::addresses::Addr;
-use super::error::{ParseError, ParseResult};
-use super::logging::EventLog;
+use super::error::ViolationKind;
 use super::util::{self, TagLengthValue};
 use std::convert::TryInto;
 
@@ -152,21 +148,21 @@ impl<'arena> Buffer<'arena> {
 pub(super) struct MessageParser;
 
 impl MessageParser {
-    fn check_magic(buffer: &mut Buffer) -> ParseResult<()> {
+    fn check_magic(buffer: &mut Buffer) -> Result<(), ViolationKind> {
         buffer
             .next()
             .filter(|m| *m == util::PROTOCOL_MAGIC)
             .map(|_| ())
-            .ok_or_else(|| ParseError::NotAMircDatagram)
+            .ok_or(ViolationKind::NotAMircDatagram)
     }
 
-    fn check_version(buffer: &mut Buffer) -> ParseResult<()> {
+    fn check_version(buffer: &mut Buffer) -> Result<(), ViolationKind> {
         buffer.next().map_or_else(
-            || Err(ParseError::NotAMircDatagram),
+            || Err(ViolationKind::NotAMircDatagram),
             |v| {
                 (v == util::PROTOCOL_VERSION)
                     .then_some(())
-                    .ok_or(ParseError::UnsupportedProtocolVersion(v))
+                    .ok_or(ViolationKind::UnsupportedProtocolVersion(v))
             },
         )
     }
@@ -183,35 +179,24 @@ impl MessageParser {
     /// - the array contains no valid TLV.
     /// If the parsing fails after some TLVs have been found, the parsing
     /// is interrupted, those TLVs are returned and the event is logged.
-    pub fn try_parse(
-        addr: &Addr,
-        buffer: &mut Buffer,
-        logger: &EventLog,
-    ) -> ParseResult<Vec<TagLengthValue>> {
+    pub fn try_parse(buffer: &mut Buffer) -> Result<Vec<TagLengthValue>, ViolationKind> {
         // Checking that the DGram starts with bytes 95 0.
         Self::check_magic(buffer)?;
         Self::check_version(buffer)?;
 
-        let body_length = Self::parse_body_length(buffer)
-            .ok_or_else(|| ParseError::ProtocolViolation(addr.clone()))?;
+        let body_length = Self::parse_body_length(buffer).ok_or(ViolationKind::InvalidLength)?;
 
         // Discard bytes according to the specified body length
         buffer
             .shrink(body_length)
-            .map_err(|()| ParseError::ProtocolViolation(addr.clone()))?;
+            .map_err(|()| ViolationKind::InvalidLength)?;
 
         let mut tags = vec![];
 
         while buffer.has_next() {
             match TagLengthValue::try_parse(buffer) {
                 Some(tlv) => tags.push(tlv),
-                None if !tags.is_empty() => {
-                    logger.warning(lazy_format!(
-                        "While processing bytes received from {addr}: Parsing interrupted before the end of the message \
-                        due to a protocol violation. Keeping only the TLVs parsed so far."));
-                    break;
-                }
-                None => return Err(ParseError::ProtocolViolation(addr.clone())),
+                None => return Err(ViolationKind::InvalidSequenceOfTlv),
             }
         }
         Ok(tags)

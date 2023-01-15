@@ -7,7 +7,7 @@
 use derive_more::{Display, From};
 use std::sync::Mutex;
 
-use super::datetime;
+use super::datetime::DateTime;
 
 /// This enum allows to control how verbose the program should be.
 /// This enum may not be exhaustive, the position of the levels may change.
@@ -126,7 +126,7 @@ impl EventLog {
                 // For now, the logger sends the event to stderr.
                 eprintln!(
                     "[{0}] {1}: {2}",
-                    datetime::now_formatted(),
+                    DateTime::now().formatted(),
                     severity,
                     msg.to_string_once()
                 );
