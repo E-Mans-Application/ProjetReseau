@@ -9,7 +9,7 @@ use self::{
     addresses::Addr,
     error::UseClientError,
     lib::{LocalUser, MircHost},
-    logging::{EventLog, VerboseLevel},
+    logging::{EventLog, Printer, VerboseLevel},
 };
 
 mod addresses;
@@ -18,7 +18,6 @@ pub mod error;
 mod lib;
 pub mod logging;
 mod parse;
-mod sync;
 mod util;
 
 /// Internal use (see below).
@@ -55,6 +54,7 @@ enum UseClientStatus {
 pub fn use_client<F, R>(
     port: u16,
     first_neighbour: &str,
+    printer: impl Printer + Send + 'static,
     verbose: VerboseLevel,
     f: F,
 ) -> Result<R, UseClientError>
@@ -62,12 +62,12 @@ where
     F: FnOnce(Sender<String>, Arc<EventLog>) -> R,
 {
     crossbeam::scope(|s| {
-        let logger = Arc::new(EventLog::new(verbose));
+        let logger = Arc::new(EventLog::new(printer, verbose));
         let logger_th = Arc::clone(&logger);
 
         let (sender, receiver) = channel::unbounded();
 
-        let handle = sync::spawn_control(s, move |this| {
+        let handle = crate::sync::spawn_control(s, move |this| {
             let neighbour = Addr::try_from(first_neighbour)
                 .map_err(|_err| UseClientError::InvalidNeighbourAddress)?;
 

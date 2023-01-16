@@ -40,16 +40,21 @@
 
 extern crate clap;
 extern crate crossbeam;
-extern crate ctrlc;
 extern crate derive_more;
 extern crate rand;
 
-use api::{error, logging::VerboseLevel, use_client};
+use api::{
+    logging::{Printer, VerboseLevel},
+    use_client,
+};
 use std::str::FromStr;
+use toplevel::TopLevelError;
 
 use self::clap::Parser;
 
 mod api;
+mod sync;
+mod toplevel;
 
 #[derive(Parser)]
 struct Cli {
@@ -59,21 +64,22 @@ struct Cli {
     verbose: Option<String>,
 }
 
-fn main() -> Result<(), error::UseClientError> {
+fn main() -> Result<(), toplevel::TopLevelError> {
     let args = Cli::parse();
     let verbose_level = args
         .verbose
         .ok_or(())
         .and_then(|s| VerboseLevel::from_str(&s))
         .unwrap_or_default();
-    println!("Verbose level: {verbose_level}");
 
-    // unwrap: no matter if it panics, because the program should exit anyway in this case.
-    let mut rl = rustyline::Editor::<()>::new().unwrap();
+    let mut rl = rustyline::Editor::<()>::new()?;
+    let mut printer = rl.create_external_printer()?;
+    printer.print(format!("Verbose level: {verbose_level}\n"));
 
     use_client(
         args.port,
         &args.first_neighbour,
+        printer,
         verbose_level,
         |sender, logger| loop {
             let readline = rl.readline("");
@@ -89,4 +95,5 @@ fn main() -> Result<(), error::UseClientError> {
             }
         },
     )
+    .map_err(TopLevelError::from)
 }

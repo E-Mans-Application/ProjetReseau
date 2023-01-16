@@ -8,7 +8,6 @@ use std::{
     cell::RefCell,
     collections::{hash_map::Entry, HashMap, HashSet},
     convert::TryFrom,
-    io::Write,
     iter::FromIterator,
     net::{SocketAddr, UdpSocket},
     rc::{Rc, Weak},
@@ -765,7 +764,7 @@ impl<'arena> RecentDataMap<'arena> {
         while MAX_RECENT_DATA_COUNT > 0 && self.recent_data.len() > MAX_RECENT_DATA_COUNT {
             let mut min: Option<(MessageId, DateTime)> = None;
             for data in self.recent_data.values() {
-                if min.is_none() || min.unwrap().1 < data.receive_time {
+                if !min.is_some_and(|rt| rt.1 >= data.receive_time) {
                     min = Some((data.msg_id, data.receive_time));
                 }
             }
@@ -1056,8 +1055,7 @@ impl<'arena> LocalUser<'arena> {
                 sender,
                 str
             );
-            report_on_fail!(self.logger, std::io::stdout().lock().write(str.as_bytes()));
-            report_on_fail!(self.logger, std::io::stdout().lock().write(b"\n"));
+            self.logger.print(format!("{str}\n"));
         } else {
             log_info!(
                 self,
@@ -1130,14 +1128,7 @@ impl<'arena> LocalUser<'arena> {
             }
 
             TagLengthValue::GoAway(_reason, msg) => {
-                // TODO
-                // If some students' implementations undertake different actions
-                // depending on the GoAwayReason, and also use their own non-standard codes,
-                // using GoAwayReason::Reciprocation might be a problem.
-
-                self.neighbours
-                    .borrow_mut()
-                    .dismiss(&[sender], GoAwayReason::Reciprocation, None);
+                self.neighbours.borrow_mut().tva.remove(sender);
 
                 if let Some(Err(err)) = msg {
                     log_anomaly!(

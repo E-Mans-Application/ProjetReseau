@@ -211,9 +211,6 @@ pub enum GoAwayReason {
     EmitterLeaving,
     Inactivity,
     ProtocolViolation,
-    /// Reply to a GoAway
-    #[deprecated = "non-standard"]
-    Reciprocation,
 }
 
 impl GoAwayReason {
@@ -226,7 +223,6 @@ impl GoAwayReason {
             Self::CODE_EMITTER_LEAVING => Self::EmitterLeaving,
             Self::CODE_INACTIVITY => Self::Inactivity,
             Self::CODE_PROTOCOL_VIOLATION => Self::ProtocolViolation,
-            4 => Self::Reciprocation,
             _ => Self::Unknown,
         }
     }
@@ -236,7 +232,6 @@ impl GoAwayReason {
             Self::EmitterLeaving => Self::CODE_EMITTER_LEAVING,
             Self::Inactivity => Self::CODE_INACTIVITY,
             Self::ProtocolViolation => Self::CODE_PROTOCOL_VIOLATION,
-            Self::Reciprocation => 4,
         }
     }
 

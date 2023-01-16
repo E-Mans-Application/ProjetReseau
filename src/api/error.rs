@@ -80,12 +80,15 @@ impl Error for NeighbourInactive {}
 
 /// Error that may occur when using the ready-to-use function
 /// [`crate::api::use_client`].
-#[derive(From, Debug)]
+#[derive(From, Debug, Display)]
 pub enum UseClientError {
+    #[display(fmt = "{_0:?}")]
     PanicError(Box<dyn std::any::Any + Send + 'static>),
     IOError(std::io::Error),
     InvalidNeighbourAddress,
 }
+
+impl Error for UseClientError {}
 
 pub(super) type ParseResult<R> = std::result::Result<R, ParseError>;
 pub(super) type InactivityResult<R> = std::result::Result<R, NeighbourInactive>;

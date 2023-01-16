@@ -19,22 +19,22 @@ pub enum VerboseLevel {
     /// This level is guaranteed to be lower than that of any event.
     /// It is also guaranteed to correspond to the numeric value 0.
     /// It is used to disable logging of all events.
+    /// ### Note:
+    /// This level is deprecated, because it will also hide UI-relevant
+    /// messages. Use [`VerboseLevel::UiRelevant`] instead.
     Disabled = 0,
     /// Verbose level of severe (but not critical) internal errors.
-    #[display(fmt = "\x1b[1;31mInternal error\x1b[0m")]
+    #[display(fmt = "Internal error")]
     InternalError,
     /// Verbose level of non-critical events that should not have occurred
     /// and require further investigation.
-    #[display(fmt = "\x1b[1;93mWarning\x1b[0m")]
     Warning,
     /// Verbose level of unexpected events that may not require special action.
     /// Those events are likely to be the remote's fault.
-    #[display(fmt = "\x1b[1;34mAnomaly\x1b[0m")]
     #[default]
     Anomaly,
     /// Verbose level of important information that may interest the user, even
     /// when not debugging.
-    #[display(fmt = "\x1b[1mImportant\x1b[0m")]
     Important,
     /// Verbose level of events that are noticeable but should be silenced in
     /// non-debug runs.
@@ -77,6 +77,19 @@ impl VerboseLevel {
     const TRACE_STR: &str = "trace";
     const DEBUG_STR: &str = "debug";
     const FULL_STR: &str = "full";
+
+    fn get_header(self) -> &'static str {
+        match self {
+            Self::Disabled | Self::Full => "",
+            Self::InternalError => "\x1b[1;31mInternal error\x1b[0m",
+            Self::Warning => "\x1b[1;93mWarning\x1b[0m",
+            Self::Anomaly => "\x1b[1;34mAnomaly\x1b[0m",
+            Self::Important => "\x1b[1mImportant\x1b[0m",
+            Self::Information => "Information",
+            Self::Trace => "Trace",
+            Self::Debug => "Debug",
+        }
+    }
 }
 
 impl std::str::FromStr for VerboseLevel {
@@ -99,6 +112,10 @@ impl std::str::FromStr for VerboseLevel {
 
 /* #endregion */
 
+pub trait Printer {
+    fn print(&mut self, value: String);
+}
+
 /* #region EventLog */
 
 /// A thread-safe event logger.
@@ -106,34 +123,44 @@ impl std::str::FromStr for VerboseLevel {
 /// `ToString` objects, and by the struct `LazyFormat` (see below)
 pub struct EventLog {
     max_level: VerboseLevel,
-    barrier: Mutex<()>,
+    barrier: Mutex<Box<dyn Printer + Send + 'static>>,
 }
 
 impl EventLog {
     /// Creates a new `EventLog`, that shall log only the events that have at
     /// most verbose level `max_level`.
-    pub const fn new(max_level: VerboseLevel) -> Self {
+    ///
+    /// The events that should be logged are printed to the specified `printer`.
+    /// This can be any object that implements the traits [`self::Printer`] and
+    /// [`core::marker::Send`].
+    pub fn new(printer: impl Printer + Send + 'static, max_level: VerboseLevel) -> Self {
         Self {
             max_level,
-            barrier: Mutex::new(()),
+            barrier: Mutex::new(Box::new(printer)),
         }
     }
 
+    /// Prints the given `msg` as-is (without adding a header).
+    /// This method prints even if the verbose level is [`VerboseLevel::Disabled`].
+    pub fn print<T: ToString>(&self, msg: T) {
+        if let Ok(mut printer) = self.barrier.lock() {
+            printer.print(msg.to_string());
+        }
+    }
+
+    /// Log the specified event, only if it has a sufficient verbosity.
+    /// A new line is automatically added at the end of the message.
+    /// 
+    /// The event is printed with the current date and time and the name of its
+    /// verbose level.
     pub fn log_event<T: ToStringOnce>(&self, severity: VerboseLevel, msg: T) {
-        if self.barrier.lock().is_ok() {
-            // Synchronization
-            if severity <= self.max_level {
-                // For now, the logger sends the event to stderr.
-                eprintln!(
-                    "[{0}] {1}: {2}",
-                    DateTime::now().formatted(),
-                    severity,
-                    msg.to_string_once()
-                );
-            }
-        } else {
-            eprintln!("Fatal: Program memory is corrupt due to a previous error. Exiting.");
-            std::process::exit(6)
+        if severity <= self.max_level {
+            self.print(format!(
+                "[{0}] {1}: {2}\n",
+                DateTime::now().formatted(),
+                severity.get_header(),
+                msg.to_string_once()
+            ));
         }
     }
 
