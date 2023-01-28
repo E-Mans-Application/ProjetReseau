@@ -9,7 +9,7 @@ use self::{
     addresses::Addr,
     error::UseClientError,
     lib::{LocalUser, MircHost},
-    logging::{EventLog, Printer, VerboseLevel},
+    logging::{EventLog, Printer, VerboseLevel}, util::LimitedString,
 };
 
 mod addresses;
@@ -19,6 +19,7 @@ mod lib;
 pub mod logging;
 mod parse;
 mod util;
+
 
 /// Internal use (see below).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -34,8 +35,9 @@ enum UseClientStatus {
 /// Most of the other structures and methods are non-public intentionally.
 ///
 /// This function takes as arguments the local UDP binding port of the client, the
-/// address of the first neighbour to contact, a verbose level indicating which events
-/// should be printed to stderr, and a closure.
+/// address of the first neighbour to contact, the optional nickname of the local user,
+/// a thread-safe printer that will be used to print events and messages,
+/// a verbose level indicating which events should be printed, and a closure.
 ///
 /// The closure should block the current thread until the client should be disconnected.
 ///
@@ -51,9 +53,10 @@ enum UseClientStatus {
 /// - if the address of the first neighbour is invalid,
 /// - if the closure panics,
 /// - if the MIRC client panics (unlikely)
-pub fn use_client<F, R>(
+pub fn use_client<F, R>(    
     port: u16,
     first_neighbour: &str,
+    nickname: Option<String>,
     printer: impl Printer + Send + 'static,
     verbose: VerboseLevel,
     f: F,
@@ -74,7 +77,13 @@ where
             let alloc = bumpalo::Bump::new();
             let socket = MircHost::new(port, &logger_th)?;
 
-            let mut client = LocalUser::new(neighbour, &alloc, &socket, receiver);
+            let nickname = if let Some(n) = nickname {
+                Some(LimitedString::try_from(n).map_err(|_err| UseClientError::NicknameTooLong)?)
+            } else {
+                None
+            };
+
+            let mut client = LocalUser::new(nickname, neighbour, &alloc, &socket, receiver);
 
             // The parent thread should wait until this thread reaches this line to
             // call the closure. (Previous statements may fail.)

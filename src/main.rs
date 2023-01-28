@@ -61,6 +61,8 @@ struct Cli {
     port: u16,
     first_neighbour: String,
     #[arg(short, long)]
+    nickname: Option<String>,
+    #[arg(short, long)]
     verbose: Option<String>,
 }
 
@@ -79,6 +81,7 @@ fn main() -> Result<(), toplevel::TopLevelError> {
     use_client(
         args.port,
         &args.first_neighbour,
+        args.nickname,
         printer,
         verbose_level,
         |sender, logger| loop {
@@ -91,7 +94,7 @@ fn main() -> Result<(), toplevel::TopLevelError> {
                         ));
                     }
                 }
-                Err(_err) => return,
+                Err(_err) =>  return,
             }
         },
     )

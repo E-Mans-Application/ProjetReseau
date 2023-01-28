@@ -133,7 +133,7 @@ impl<const S: usize> LimitedString<S> {
 
 /* #region Data */
 
-const DATA_MAX_SIZE: usize = 235;
+const DATA_MAX_SIZE: usize = 243;
 
 #[derive(Debug, Clone)]
 pub(super) struct Data(Result<LimitedString<DATA_MAX_SIZE>, Vec<u8>>);
@@ -162,7 +162,7 @@ impl Data {
             Err(raw) => raw.as_slice(),
         }
     }
-    pub fn to_string(&self) -> Option<&LimitedString<235>> {
+    pub fn to_string(&self) -> Option<&LimitedString<DATA_MAX_SIZE>> {
         match &self.0 {
             Ok(msg) => Some(msg),
             Err(_) => None,
@@ -170,21 +170,28 @@ impl Data {
     }
 
     /// Divides a string value in multiple `Data`s,
-    /// such as all `Data`s contain a valid UTF-8 string,
-    /// and the concatenation of the `Data`s is the
+    /// such as all `Data`s start with the specified `header`,
+    /// contain a valid UTF-8 string,
+    /// and the concatenation of the `Data`s without the `header` is the
     /// initial value.
-    pub fn pack(value: &str) -> Vec<Self> {
-        if value.is_empty() {
-            return vec![];
-        }
-        if value.len() <= DATA_MAX_SIZE {
-            // Safety: value.len() <= DATA_MAX_SIZE
-            return vec![unsafe { Self(Ok(LimitedString::from_str_unchecked(value))) }];
+    pub fn pack(header: Option<String>, value: &str) -> Vec<Self> {
+     
+        let header_size = header.as_ref().map(String::len).unwrap_or(0);
+        
+        // Check that it is always possible to put (at least) the header +
+        // one UTF-8 char in one Data object.
+        assert!(header_size + 4 <= DATA_MAX_SIZE);
+
+        let initial_value = header.unwrap_or_default();
+
+        if header_size + value.len() <= DATA_MAX_SIZE {
+            // Safety: header_size + value.len() <= DATA_MAX_SIZE
+            let value = initial_value + value;
+            return vec![unsafe { Self(Ok(LimitedString::from_str_unchecked(&value))) }];
         }
 
         let mut vec = vec![];
-
-        let mut str = String::new();
+        let mut str = initial_value.clone();
 
         for c in value.chars() {
             if str.len() + c.len_utf8() <= DATA_MAX_SIZE {
@@ -192,7 +199,9 @@ impl Data {
             } else {
                 // Safety: str.len() <= DATA_MAX_SIZE is an invariant.
                 vec.push(unsafe { Self(Ok(LimitedString::from_str_unchecked(&str))) });
-                str = String::from(c);
+                
+                str = initial_value.clone();
+                str.push(c);
             }
         }
 

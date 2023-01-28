@@ -86,6 +86,8 @@ pub enum UseClientError {
     PanicError(Box<dyn std::any::Any + Send + 'static>),
     IOError(std::io::Error),
     InvalidNeighbourAddress,
+    #[display(fmt = "NicknameTooLong: the nickname must be less than {0} chars.", super::lib::MAX_NICKNAME_LENGTH)]
+    NicknameTooLong,
 }
 
 impl Error for UseClientError {}

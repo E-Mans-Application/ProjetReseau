@@ -6,7 +6,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     convert::TryFrom,
     iter::FromIterator,
     net::{SocketAddr, UdpSocket},
@@ -99,6 +99,16 @@ const NEIGHBOURHOOD_BROADCAST_INTERVAL: MillisType = 30_000;
 /// The minimum interval (in milliseconds) between two "pings" to the potential neighbours.
 /// (A ping is the operation performed when [`MIN_DESIRED_SYMMETRIC`] is not respected.)
 const MIN_PING_INTERVAL: MillisType = 30_000;
+
+/// The max length of the nickname of the user (used as a header for all `Data` messages
+/// written by the user).
+/// 
+/// MUST be less than ``` DATA_MAX_SIZE - 6 ```
+/// because ``` NICKNAME_LENGTH + 1 (space) + 1 (colon) + 4 (max size of a UTF-8 char) <= DATA_MAX_SIZE ```
+/// must hold to guarantee that the `Data` TLVs can contain at least one char of the actual message.
+pub(super) const MAX_NICKNAME_LENGTH: usize = 20;
+
+pub(super) type NickName = LimitedString<MAX_NICKNAME_LENGTH>;
 
 /* #endregion */
 
@@ -547,7 +557,7 @@ impl<'arena> DeliveryStatus<'arena> {
 
 /* #endregion */
 
-/* #region DataToFlood */
+/* #region RecentDatum */
 
 /// This structure stores informations about a recent datum.
 struct RecentDatum<'arena> {
@@ -648,16 +658,20 @@ impl<'arena> RecentDatum<'arena> {
 /// It is also responsible for processing the messages that the local
 /// user wants to send.
 struct RecentDataMap<'arena> {
+    nickname: Option<NickName>,
     neighbourhood: Rc<RefCell<NeighbourHood<'arena>>>,
     next_msg_id: u32,
     stream: Receiver<String>,
     recent_data: HashMap<MessageId, RecentDatum<'arena>>,
+    data_sorted: VecDeque<MessageId>,
     socket: &'arena MircHost<'arena>,
 }
 
 impl<'arena> RecentDataMap<'arena> {
     /// Creates a new `RecentDataMap` for the given `neighbourhood`.
     ///
+    /// If `nickname` is not `None`, the string `nickname: ` will be added
+    /// at the beginning of all `Data` messages written by the user.
     /// `stream` is the receiver-side of a thread-safe channel.
     /// The messages should only be written to the sender-side of the same
     /// channel.
@@ -666,15 +680,18 @@ impl<'arena> RecentDataMap<'arena> {
     /// thread-safe, and wrapping all of them inside thread-safe lockers would
     /// cause unnecessary overhead.
     fn new(
+        nickname: Option<NickName>,
         neighbourhood: Rc<RefCell<NeighbourHood<'arena>>>,
         stream: Receiver<String>,
         socket: &'arena MircHost<'arena>,
     ) -> Self {
         Self {
+            nickname,
             neighbourhood,
             next_msg_id: 0,
             stream,
             recent_data: HashMap::new(),
+            data_sorted: VecDeque::new(),
             socket,
         }
     }
@@ -691,7 +708,12 @@ impl<'arena> RecentDataMap<'arena> {
         if data.neighbours_to_flood.is_empty() {
             log_important!(self.socket, "There is nobody to send your message to...");
         }
-        self.recent_data.try_insert(msg_id, data).is_ok()
+        if self.recent_data.try_insert(msg_id, data).is_ok() {
+            self.data_sorted.push_back(msg_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// Reads the stream and prepares the delivery of the transmitted messages.
@@ -702,7 +724,8 @@ impl<'arena> RecentDataMap<'arena> {
     /// function is called.
     fn read_stream(&mut self, local_id: PeerID, rng: &mut StdRng) {
         if let Ok(data_str) = self.stream.try_recv() {
-            let data_vec = Data::pack(data_str.trim());
+            let header = self.nickname.as_ref().map(|str| str.to_string() + ": ");
+            let data_vec = Data::pack(header, data_str.trim());
 
             for data in data_vec {
                 log_trace!(
@@ -762,15 +785,9 @@ impl<'arena> RecentDataMap<'arena> {
     /// (*) only if those parameters are non-null.
     fn clean(&mut self) {
         while MAX_RECENT_DATA_COUNT > 0 && self.recent_data.len() > MAX_RECENT_DATA_COUNT {
-            let mut min: Option<(MessageId, DateTime)> = None;
-            for data in self.recent_data.values() {
-                if !min.is_some_and(|rt| rt.1 >= data.receive_time) {
-                    min = Some((data.msg_id, data.receive_time));
-                }
-            }
-            log_warning!(self.socket, "Given up flooding message {0} because the maximum number of recent data has been exceeded.", min.unwrap().0);
-            // min is obviously not None
-            self.recent_data.remove(&min.unwrap().0);
+            let oldest = self.data_sorted.pop_front();
+            // oldest is obivously non-null.
+            self.recent_data.remove(&oldest.unwrap());
         }
 
         if MAX_RECENT_DATA_AGE > 0 {
@@ -1003,12 +1020,16 @@ pub(super) struct LocalUser<'arena> {
 
 impl<'arena> LocalUser<'arena> {
     /// Creates a new `LocalUser` object.
+    /// - `nickname` (optional) will be added before all the `Data` messages
+    /// written by the user. A long nickname may increase the need for splitting
+    /// messages.
     /// - `first_neighbour` is the address of the first neighbour to contact
     /// - `alloc` is the allocator that will be used for hash consing
     /// - `receiver` is the receiver-side of a thread-safe channel.
     /// The messages that the local user wants to send should be passed to
     /// the sender-side of the same channel.
     pub fn new(
+        nickname: Option<NickName>,
         first_neighbour: Addr,
         alloc: &'arena bumpalo::Bump,
         socket: &'arena MircHost<'arena>,
@@ -1023,7 +1044,7 @@ impl<'arena> LocalUser<'arena> {
         neighbours.welcome(first_neighbour, true);
         let neighbours = Rc::new(RefCell::new(neighbours));
 
-        let data = RecentDataMap::new(Rc::clone(&neighbours), receiver, socket);
+        let data = RecentDataMap::new(nickname, Rc::clone(&neighbours), receiver, socket);
 
         Self {
             id,
@@ -1055,7 +1076,7 @@ impl<'arena> LocalUser<'arena> {
                 sender,
                 str
             );
-            self.logger.print(format!("{str}\n"));
+            self.logger.print(format!("\x1b[1;36m{str}\x1b[0m\n"));
         } else {
             log_info!(
                 self,
