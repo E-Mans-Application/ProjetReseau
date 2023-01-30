@@ -55,6 +55,7 @@ use self::clap::Parser;
 mod api;
 mod sync;
 mod toplevel;
+mod priority_map;
 
 #[derive(Parser)]
 struct Cli {

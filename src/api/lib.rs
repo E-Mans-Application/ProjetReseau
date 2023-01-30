@@ -6,7 +6,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
+    collections::{hash_map::Entry, HashMap, HashSet},
     convert::TryFrom,
     iter::FromIterator,
     net::{SocketAddr, UdpSocket},
@@ -21,7 +21,7 @@ use super::{
     parse::{Buffer, MessageParser},
     util::{Data, GoAwayReason, LimitedString, MessageFactory, MessageId, PeerID, TagLengthValue},
 };
-use crate::{lazy_format, log_anomaly, log_debug, log_important, log_info, log_trace, log_warning};
+use crate::{lazy_format, log_anomaly, log_debug, log_important, log_info, log_trace, log_warning, priority_map::QueuedMap};
 
 /* #region PARAMETERS */
 
@@ -562,8 +562,8 @@ impl<'arena> DeliveryStatus<'arena> {
 /// This structure stores informations about a recent datum.
 struct RecentDatum<'arena> {
     msg_id: MessageId,
-    receive_time: DateTime, //TODO
     precomputed: Rc<[u8]>,
+    receive_time: DateTime,
     neighbours_to_flood: HashMap<&'arena Addr, DeliveryStatus<'arena>>,
     socket: &'arena MircHost<'arena>,
 }
@@ -596,9 +596,9 @@ impl<'arena> RecentDatum<'arena> {
 
         Self {
             msg_id,
-            receive_time: date_now,
             precomputed,
             neighbours_to_flood,
+            receive_time: date_now,
             socket,
         }
     }
@@ -662,8 +662,7 @@ struct RecentDataMap<'arena> {
     neighbourhood: Rc<RefCell<NeighbourHood<'arena>>>,
     next_msg_id: u32,
     stream: Receiver<String>,
-    recent_data: HashMap<MessageId, RecentDatum<'arena>>,
-    data_sorted: VecDeque<MessageId>,
+    recent_data: QueuedMap<MessageId, RecentDatum<'arena>>,
     socket: &'arena MircHost<'arena>,
 }
 
@@ -690,8 +689,7 @@ impl<'arena> RecentDataMap<'arena> {
             neighbourhood,
             next_msg_id: 0,
             stream,
-            recent_data: HashMap::new(),
-            data_sorted: VecDeque::new(),
+            recent_data: QueuedMap::new(),
             socket,
         }
     }
@@ -708,12 +706,7 @@ impl<'arena> RecentDataMap<'arena> {
         if data.neighbours_to_flood.is_empty() {
             log_important!(self.socket, "There is nobody to send your message to...");
         }
-        if self.recent_data.try_insert(msg_id, data).is_ok() {
-            self.data_sorted.push_back(msg_id);
-            true
-        } else {
-            false
-        }
+        self.recent_data.try_insert(msg_id, data)
     }
 
     /// Reads the stream and prepares the delivery of the transmitted messages.
@@ -785,9 +778,7 @@ impl<'arena> RecentDataMap<'arena> {
     /// (*) only if those parameters are non-null.
     fn clean(&mut self) {
         while MAX_RECENT_DATA_COUNT > 0 && self.recent_data.len() > MAX_RECENT_DATA_COUNT {
-            let oldest = self.data_sorted.pop_front();
-            // oldest is obivously non-null.
-            self.recent_data.remove(&oldest.unwrap());
+            self.recent_data.pop_oldest();
         }
 
         if MAX_RECENT_DATA_AGE > 0 {
