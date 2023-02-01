@@ -1,0 +1,19 @@
+[package]
+name = "projet"
+version.workspace = true
+
+[dependencies]
+collections_more.path = "../collections_more"
+
+derive_more.workspace = true
+
+rand = "0.8.5"
+bumpalo = "3.11.1"
+clap = { version = "4.0.32", features = ["derive"] }
+crossbeam = "0.8.2"
+chrono = {version =  "0.4.23", features = ["clock"] }
+rustyline = "10.1.0"
+socket2= "0.4.7"
+
+[target.'cfg(unix)'.dependencies]
+pnet="0.30.0"

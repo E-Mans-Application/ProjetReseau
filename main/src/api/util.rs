@@ -10,7 +10,7 @@ use self::derive_more::Display;
 use super::addresses::Addr;
 use super::error::{LimitedStringError, UnsupportedTag};
 use super::parse;
-use std::collections::VecDeque;
+use std::collections::LinkedList;
 use std::convert::TryFrom;
 use std::rc::Rc;
 
@@ -175,18 +175,17 @@ impl Data {
     /// and the concatenation of the `Data`s without the `header` is the
     /// initial value.
     pub fn pack(header: Option<String>, value: &str) -> Vec<Self> {
-     
-        let header_size = header.as_ref().map(String::len).unwrap_or(0);
-        
+        let header_size = header.as_ref().map_or(0, String::len);
+
         // Check that it is always possible to put (at least) the header +
         // one UTF-8 char in one Data object.
-        assert!(header_size + 4 <= DATA_MAX_SIZE);
+        debug_assert!(header_size + 4 <= DATA_MAX_SIZE);
 
         let initial_value = header.unwrap_or_default();
 
         if header_size + value.len() <= DATA_MAX_SIZE {
-            // Safety: header_size + value.len() <= DATA_MAX_SIZE
             let value = initial_value + value;
+            // Safety: header_size + value.len() <= DATA_MAX_SIZE
             return vec![unsafe { Self(Ok(LimitedString::from_str_unchecked(&value))) }];
         }
 
@@ -199,7 +198,7 @@ impl Data {
             } else {
                 // Safety: str.len() <= DATA_MAX_SIZE is an invariant.
                 vec.push(unsafe { Self(Ok(LimitedString::from_str_unchecked(&str))) });
-                
+
                 str = initial_value.clone();
                 str.push(c);
             }
@@ -503,14 +502,14 @@ impl MessagePart {
 /// A buffered queue-like factory to construct service data units.
 pub(super) struct MessageFactory {
     total_bytes: usize,
-    buffer: VecDeque<MessagePart>,
+    buffer: LinkedList<MessagePart>,
 }
 
 impl MessageFactory {
     pub const fn new() -> MessageFactory {
         MessageFactory {
             total_bytes: 0,
-            buffer: VecDeque::new(),
+            buffer: LinkedList::new(),
         }
     }
 
@@ -532,7 +531,7 @@ impl MessageFactory {
     /// Enqueuing multiple TLVs using this function is not supported (because it is not
     /// useful in the program) and may lead to unexpected results.
     pub fn enqueue_precomputed(&mut self, bytes: Rc<[u8]>) {
-        assert!(bytes.len() < MAX_SDU_SIZE - 4);
+        debug_assert!(bytes.len() < MAX_SDU_SIZE - 4);
         self.total_bytes += bytes.len();
         self.buffer.push_back(MessagePart::Precomputed(bytes));
     }
@@ -546,22 +545,26 @@ impl MessageFactory {
     /// Builds a single SDU from the queue, by concatenating
     /// as many enqueued TLVs as possible without exceeding the
     /// maximum length of a SDU. Those TLVs are removed from the queue.
-    /// The initial order of the TLVs is preserved.
+    /// This function uses a greedy algorithm. The TLVs that were enqueued
+    /// first are given a higher priority.
     /// The returned value should be sent as-is.
     /// When this method returns, there may still be TLVs in the queue.
     pub fn build_next(&mut self) -> Option<Vec<u8>> {
         let mut vec = vec![PROTOCOL_MAGIC, PROTOCOL_VERSION, 0u8, 0u8];
 
-        while let Some(part) = self.buffer.pop_front() {
+        let mut cursor = self.buffer.cursor_front_mut();
+        while let Some(part) = cursor.current() {
             if vec.len() + part.len_in_bytes() < MAX_SDU_SIZE {
-                self.total_bytes -= part.len_in_bytes();
                 vec.extend(part.to_bytes().iter());
-                assert!(part.len_in_bytes() == part.to_bytes().len());
+                debug_assert!(part.len_in_bytes() == part.to_bytes().len());
+
+                self.total_bytes -= part.len_in_bytes();
+                cursor.remove_current();
             } else {
-                self.buffer.push_front(part);
-                break;
+                cursor.move_next();
             }
         }
+
         if vec.len() == 4 {
             return None;
         }

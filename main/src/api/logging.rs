@@ -19,9 +19,6 @@ pub enum VerboseLevel {
     /// This level is guaranteed to be lower than that of any event.
     /// It is also guaranteed to correspond to the numeric value 0.
     /// It is used to disable logging of all events.
-    /// ### Note:
-    /// This level is deprecated, because it will also hide UI-relevant
-    /// messages. Use [`VerboseLevel::UiRelevant`] instead.
     Disabled = 0,
     /// Verbose level of severe (but not critical) internal errors.
     #[display(fmt = "Internal error")]
@@ -142,20 +139,20 @@ impl EventLog {
 
     /// Prints the given `msg` as-is (without adding a header).
     /// This method prints even if the verbose level is [`VerboseLevel::Disabled`].
-    pub fn print<T: ToString>(&self, msg: T) {
+    pub fn print(&self, msg: &str) {
         if let Ok(mut printer) = self.barrier.lock() {
-            printer.print(msg.to_string());
+            printer.print(msg.to_owned());
         }
     }
 
     /// Log the specified event, only if it has a sufficient verbosity.
     /// A new line is automatically added at the end of the message.
-    /// 
+    ///
     /// The event is printed with the current date and time and the name of its
     /// verbose level.
     pub fn log_event<T: ToStringOnce>(&self, severity: VerboseLevel, msg: T) {
         if severity <= self.max_level {
-            self.print(format!(
+            self.print(&format!(
                 "[{0}] {1}: {2}\n",
                 DateTime::now().formatted(),
                 severity.get_header(),

@@ -5,11 +5,13 @@ use std::{convert::TryFrom, sync::Arc, time::Duration};
 
 use crossbeam::channel::{self, Sender};
 
+use crate::lazy_format;
+
 use self::{
-    addresses::Addr,
     error::UseClientError,
     lib::{LocalUser, MircHost},
-    logging::{EventLog, Printer, VerboseLevel}, util::LimitedString,
+    logging::{EventLog, Printer, VerboseLevel},
+    util::LimitedString,
 };
 
 mod addresses;
@@ -19,7 +21,6 @@ mod lib;
 pub mod logging;
 mod parse;
 mod util;
-
 
 /// Internal use (see below).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -35,7 +36,7 @@ enum UseClientStatus {
 /// Most of the other structures and methods are non-public intentionally.
 ///
 /// This function takes as arguments the local UDP binding port of the client, the
-/// address of the first neighbour to contact, the optional nickname of the local user,
+/// addresses of the first neighbours to contact, the optional nickname of the local user,
 /// a thread-safe printer that will be used to print events and messages,
 /// a verbose level indicating which events should be printed, and a closure.
 ///
@@ -53,9 +54,9 @@ enum UseClientStatus {
 /// - if the address of the first neighbour is invalid,
 /// - if the closure panics,
 /// - if the MIRC client panics (unlikely)
-pub fn use_client<F, R>(    
+pub fn use_client<F, R>(
     port: u16,
-    first_neighbour: &str,
+    first_neighbours: &[String],
     nickname: Option<String>,
     printer: impl Printer + Send + 'static,
     verbose: VerboseLevel,
@@ -71,11 +72,10 @@ where
         let (sender, receiver) = channel::unbounded();
 
         let handle = crate::sync::spawn_control(s, move |this| {
-            let neighbour = Addr::try_from(first_neighbour)
-                .map_err(|_err| UseClientError::InvalidNeighbourAddress)?;
-
             let alloc = bumpalo::Bump::new();
             let socket = MircHost::new(port, &logger_th)?;
+
+            logger_th.important(lazy_format!("Bound on UDP port: {port}"));
 
             let nickname = if let Some(n) = nickname {
                 Some(LimitedString::try_from(n).map_err(|_err| UseClientError::NicknameTooLong)?)
@@ -83,7 +83,8 @@ where
                 None
             };
 
-            let mut client = LocalUser::new(nickname, neighbour, &alloc, &socket, receiver);
+            let mut client = LocalUser::new(nickname, &alloc, &socket, receiver);
+            client.preliminary_invite(first_neighbours)?;
 
             // The parent thread should wait until this thread reaches this line to
             // call the closure. (Previous statements may fail.)

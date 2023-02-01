@@ -16,14 +16,18 @@ use std::{
 use super::{
     addresses::Addr,
     datetime::{DateTime, Duration, MillisType},
-    error::{InactivityResult, NeighbourInactive, ParseError, ParseResult},
+    error::{InactivityResult, NeighbourInactive, ParseError, ParseResult, UseClientError},
     logging::EventLog,
     parse::{Buffer, MessageParser},
     util::{Data, GoAwayReason, LimitedString, MessageFactory, MessageId, PeerID, TagLengthValue},
 };
-use crate::{lazy_format, log_anomaly, log_debug, log_important, log_info, log_trace, log_warning, priority_map::QueuedMap};
+use crate::{lazy_format, log_anomaly, log_debug, log_important, log_info, log_trace, log_warning};
+use collections_more::QueuedMap;
 
 /* #region PARAMETERS */
+
+/// Indicates whether the socket should bind local addresses only.
+const LOCAL_ONLY: bool = false;
 
 /// Indicates whether the socket should use dual-stack to support
 /// IPv4 clients. This may not be supported, or not desired, on some
@@ -61,7 +65,7 @@ const ALLOW_SELF_INVITATION: bool = false;
 /// neighbours.
 ///
 /// Note: named "min_NS" in the subject.
-const MIN_DESIRED_SYMMETRIC: usize = 1; //TODO
+const MIN_DESIRED_SYMMETRIC: usize = 1;
 
 /// Delay (in milliseconds) after which a neighbour is marked as inactive
 /// if it does not say hello. (Set by the subject)
@@ -102,7 +106,7 @@ const MIN_PING_INTERVAL: MillisType = 30_000;
 
 /// The max length of the nickname of the user (used as a header for all `Data` messages
 /// written by the user).
-/// 
+///
 /// MUST be less than ``` DATA_MAX_SIZE - 6 ```
 /// because ``` NICKNAME_LENGTH + 1 (space) + 1 (colon) + 4 (max size of a UTF-8 char) <= DATA_MAX_SIZE ```
 /// must hold to guarantee that the `Data` TLVs can contain at least one char of the actual message.
@@ -129,6 +133,7 @@ impl<K, V> EntryExtension for Entry<'_, K, V> {
 struct ActiveNeighbour<'arena> {
     id: PeerID,
     addr: &'arena Addr,
+    last_greetings: DateTime,
     last_hello: DateTime,
     last_long_hello: DateTime,
 }
@@ -141,6 +146,7 @@ impl<'arena> ActiveNeighbour<'arena> {
         Self {
             id,
             addr,
+            last_greetings: DateTime::never(),
             last_hello: never,
             last_long_hello: never,
         }
@@ -156,14 +162,21 @@ impl<'arena> ActiveNeighbour<'arena> {
     /// # Errors
     /// If the neighbour has not said hello for more than [`ACTIVITY_TIMEOUT`] milliseconds,
     /// the operation is aborted and this function returns `Err(NeighbourInactive)`.
-    fn say_hello(&self, local_id: PeerID, socket: &MircHost<'arena>) -> InactivityResult<()> {
+    fn say_hello(&mut self, local_id: PeerID, socket: &MircHost<'arena>) -> InactivityResult<()> {
         if DateTime::now().millis_since(self.last_hello) > ACTIVITY_TIMEOUT {
             Err(NeighbourInactive)
         } else {
             let hello = TagLengthValue::Hello(local_id, Some(self.id));
             socket.send_single_tlv(self.addr, Rc::new(hello));
+            self.last_greetings = DateTime::now();
             Ok(())
         }
+    }
+
+    /// Indicates whether it is timely to greet (i.e. say hello) to the
+    /// active neighbours.
+    fn should_greet(&self) -> bool {
+        DateTime::now().millis_since(self.last_greetings) > HELLO_INTERVAL
     }
 }
 
@@ -175,7 +188,6 @@ struct NeighbourHood<'arena> {
     tva: HashMap<&'arena Addr, Rc<RefCell<ActiveNeighbour<'arena>>>>,
     blocked: HashMap<&'arena Addr, (u32, DateTime)>,
     last_broadcast: DateTime,
-    last_greetings: DateTime,
     last_ping: DateTime,
 }
 
@@ -195,10 +207,40 @@ impl<'arena> NeighbourHood<'arena> {
             tvp: HashSet::new(),
             tva: HashMap::new(),
             blocked: HashMap::new(),
-            last_broadcast: DateTime::now(),
-            last_greetings: DateTime::never(),
+            last_broadcast: DateTime::now().checked_add(Duration::from_millis(
+                -NEIGHBOURHOOD_BROADCAST_INTERVAL + 2_000,
+            )),
             last_ping: DateTime::never(),
         }
+    }
+
+    /// Tells whether `addr` clearly resolves to the local address of the socket.
+    /// 
+    /// This function is experimental and not exhaustive.
+    fn is_me(&self, addr: &Addr) -> bool {
+        let local = &self.socket.local_addr;
+        if addr == local {
+            return true;
+        }
+        if addr.port() != local.port() {
+            return false;
+        }
+        if local.ip().is_loopback() {
+            return true;
+        }
+
+        #[cfg(target_os = "unix")] {
+            if let Some(default_interface) = pnet::datalink::interfaces().iter().find(|e| {
+                e.is_up() && !e.is_loopback() && e.ips.iter().any(|ip| ip.is_ipv6())
+            }) {
+                for ip in &default_interface.ips {
+                    if ip.is_ipv6() && addr.ip() == ip.ip() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Welcomes a new neighbour, and adds it to the potential neighbours map.
@@ -211,6 +253,9 @@ impl<'arena> NeighbourHood<'arena> {
     /// If [`ALLOW_SELF_INVITATION`] is true, the argument `authorized` is ignored and
     /// this function only returns `None` if the neighbour has been explicitly blocked.
     fn welcome(&mut self, addr: Addr, authorized: bool) -> Option<&'arena Addr> {
+        if self.is_me(&addr) {
+            return None;
+        }
         if let Some((_, until)) = self.blocked.get(&addr) {
             if DateTime::now().millis_since(*until) <= 0 {
                 return None;
@@ -321,12 +366,6 @@ impl<'arena> NeighbourHood<'arena> {
         );
     }
 
-    /// Indicates whether it is timely to greet (i.e. say hello) to the
-    /// active neighbours.
-    fn should_greet(&self) -> bool {
-        DateTime::now().millis_since(self.last_greetings) > HELLO_INTERVAL
-    }
-
     /// Says hello to all the active neighbours.
     /// ### Side effect:
     /// This functions dismisses the neighbours that have not said hello for a long time,
@@ -335,11 +374,12 @@ impl<'arena> NeighbourHood<'arena> {
         let mut inactives = vec![];
 
         for (addr, neighbour) in &self.tva {
-            if neighbour.borrow().say_hello(id, self.socket).is_err() {
+            if neighbour.borrow().should_greet()
+                && neighbour.borrow_mut().say_hello(id, self.socket).is_err()
+            {
                 inactives.push(*addr);
             }
         }
-        self.last_greetings = DateTime::now();
 
         self.dismiss(
             &inactives,
@@ -406,9 +446,7 @@ impl<'arena> NeighbourHood<'arena> {
     /// single "routine" task.
     /// This method should be called very often.
     fn routine(&mut self, local_id: PeerID) {
-        if self.should_greet() {
-            self.greet_all(local_id);
-        }
+        self.greet_all(local_id);
 
         if self.should_ping() {
             self.ping(local_id);
@@ -471,7 +509,7 @@ impl<'arena> DeliveryStatus<'arena> {
     /// Creates a new `DeliveryStatus` object.
     /// `time` is the time the datum was received.
     /// Giving it as a parameter reduces the number of calls
-    /// to [`datetime::now`].
+    /// to [`DateTime::now`].
     /// `neighbour` is the neighbour that will be associated with this
     /// delivery status.
     /// `rng` is a reference to a random number generator.
@@ -663,6 +701,7 @@ struct RecentDataMap<'arena> {
     next_msg_id: u32,
     stream: Receiver<String>,
     recent_data: QueuedMap<MessageId, RecentDatum<'arena>>,
+    delivery_complete: HashMap<MessageId, DateTime>,
     socket: &'arena MircHost<'arena>,
 }
 
@@ -690,6 +729,7 @@ impl<'arena> RecentDataMap<'arena> {
             next_msg_id: 0,
             stream,
             recent_data: QueuedMap::new(),
+            delivery_complete: HashMap::new(),
             socket,
         }
     }
@@ -702,6 +742,9 @@ impl<'arena> RecentDataMap<'arena> {
     /// Note that nothing is actually sent through the socket until the `flood_all`
     /// function is called.
     fn insert_data(&mut self, msg_id: MessageId, data: Data, rng: &mut StdRng) -> bool {
+        if self.delivery_complete.contains_key(&msg_id) {
+            return false;
+        }
         let data = RecentDatum::new(msg_id, data, &self.neighbourhood.borrow(), rng, self.socket);
         if data.neighbours_to_flood.is_empty() {
             log_important!(self.socket, "There is nobody to send your message to...");
@@ -745,8 +788,17 @@ impl<'arena> RecentDataMap<'arena> {
         let mut inactives = HashSet::new();
         for data in self.recent_data.values_mut() {
             inactives.extend(data.flood(rng));
+            if data.flooding_complete() {
+                self.delivery_complete.insert(data.msg_id, DateTime::now());
+            }
         }
+
         self.recent_data.retain(|_, data| !data.flooding_complete());
+
+        if MAX_RECENT_DATA_AGE > 0 {
+            self.delivery_complete
+                .retain(|_, t| DateTime::now().millis_since(*t) <= MAX_RECENT_DATA_AGE);
+        }
 
         self.neighbourhood.borrow_mut().dismiss(
             Vec::from_iter(inactives).as_slice(),
@@ -778,7 +830,12 @@ impl<'arena> RecentDataMap<'arena> {
     /// (*) only if those parameters are non-null.
     fn clean(&mut self) {
         while MAX_RECENT_DATA_COUNT > 0 && self.recent_data.len() > MAX_RECENT_DATA_COUNT {
-            self.recent_data.pop_oldest();
+            if let Some((msg_id, _)) = self.recent_data.pop_oldest() {
+                log_warning!(
+                    self.socket,
+                    "Given up flooding message {msg_id} because the maximum number of recent data was exceeded."
+                );
+            }
         }
 
         if MAX_RECENT_DATA_AGE > 0 {
@@ -866,8 +923,12 @@ impl<'arena> MircHost<'arena> {
     /// the binding succeeds. Otherwise it returns an `Err` result containing the
     /// [`std::io::Error`] that has occurred when trying to bind the socket.
     pub fn new(port: u16, logger: &'arena EventLog) -> std::io::Result<Self> {
-        let addr = Addr::try_from(("::", port))
-            .map_err(|_err| std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))?;
+        let addr = if LOCAL_ONLY {
+            Addr::try_from(("::1", port))
+        } else {
+            Addr::try_from(("::", port))
+        }
+        .map_err(|_err| std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))?;
 
         let socket = socket2::Socket::new(
             socket2::Domain::IPV6,
@@ -1021,7 +1082,6 @@ impl<'arena> LocalUser<'arena> {
     /// the sender-side of the same channel.
     pub fn new(
         nickname: Option<NickName>,
-        first_neighbour: Addr,
         alloc: &'arena bumpalo::Bump,
         socket: &'arena MircHost<'arena>,
         receiver: Receiver<String>,
@@ -1031,9 +1091,7 @@ impl<'arena> LocalUser<'arena> {
         let id = PeerID::new(&mut rng);
         log_important!(socket, "Local client ID: {id}");
 
-        let mut neighbours = NeighbourHood::new(alloc, socket);
-        neighbours.welcome(first_neighbour, true);
-        let neighbours = Rc::new(RefCell::new(neighbours));
+        let neighbours = Rc::new(RefCell::new(NeighbourHood::new(alloc, socket)));
 
         let data = RecentDataMap::new(nickname, Rc::clone(&neighbours), receiver, socket);
 
@@ -1044,6 +1102,36 @@ impl<'arena> LocalUser<'arena> {
             data,
             rng,
             logger: socket.logger,
+        }
+    }
+
+    /// Invites the neighbours given as command-line arguments.
+    /// This method must be called only once, before any routine stuff.
+    /// ## Errors
+    /// Returns `Err(UseClientError::InvalidNeighbourAddress)` if `neighbours`
+    /// contains no valid addresses.
+    /// ## Panic
+    /// This function panics if some neighbours have already been invited.
+    pub(super) fn preliminary_invite(
+        &mut self,
+        neighbours: &[String],
+    ) -> Result<(), UseClientError> {
+        if !self.neighbours.borrow().tvp.is_empty() {
+            panic!("Neighbourhood already initialized!");
+        }
+        for neighbour in neighbours {
+            if let Ok(addr) = Addr::try_from(neighbour.as_str()) {
+                self.neighbours.borrow_mut().welcome(addr, true);
+            } else {
+                self.logger.error(lazy_format!(
+                    "Invalid neighbour address: {neighbour} (ignored)"
+                ));
+            }
+        }
+        if self.neighbours.borrow().tvp.is_empty() {
+            Err(UseClientError::InvalidNeighbourAddress)
+        } else {
+            Ok(())
         }
     }
 
@@ -1067,7 +1155,7 @@ impl<'arena> LocalUser<'arena> {
                 sender,
                 str
             );
-            self.logger.print(format!("\x1b[1;36m{str}\x1b[0m\n"));
+            self.logger.print(&format!("\x1b[1;36m{str}\x1b[0m\n"));
         } else {
             log_info!(
                 self,
@@ -1103,8 +1191,9 @@ impl<'arena> LocalUser<'arena> {
             }
 
             TagLengthValue::Neighbour(addr) => {
-                if addr != self.socket.local_addr {
-                    self.neighbours.borrow_mut().welcome(addr, true);
+                if let Some(addr) = self.neighbours.borrow_mut().welcome(addr, true) {
+                    self.socket
+                        .send_single_tlv(addr, Rc::new(TagLengthValue::Hello(self.id, None)));
                 }
             }
 
@@ -1181,6 +1270,8 @@ impl<'arena> LocalUser<'arena> {
     /// - flooding all data to flood (and flush the socket's buffer)
     /// - looking for messages from remote neighbours
     pub fn routine(&mut self) {
+        self.process_incoming_messages();
+
         self.neighbours.borrow_mut().routine(self.id);
 
         self.data.read_stream(self.id, &mut self.rng);
@@ -1188,7 +1279,12 @@ impl<'arena> LocalUser<'arena> {
         self.data.clean();
 
         self.socket.flush_all();
+    }
 
+    /// Processes incoming UDP messages. If there are too many messages
+    /// to be received, only a few of them are processed and the rest is
+    /// delayed to the next routine cycle.
+    fn process_incoming_messages(&mut self) {
         // If there are too many messages to receive, the rest will wait.
         // The other routine steps should not stay blocked for too long.
         for _ in 0u8..10u8 {

@@ -19,12 +19,18 @@ impl<T: rustyline::ExternalPrinter> crate::api::logging::Printer for T {
 /// This is depending on the choice of toplevel libraries.
 ///
 /// Currently, the project uses [`rustyline`] for the UI.
-#[derive(From, Display, Debug)]
+#[derive(From, Display)]
 pub enum TopLevelError {
     /// See [`crate::api::error::UseClientError`]
     UseClientError(crate::api::error::UseClientError),
     /// See [`rustyline::error::ReadlineError`]
     RustyLineError(rustyline::error::ReadlineError),
+}
+
+impl std::fmt::Debug for TopLevelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as std::fmt::Display>::fmt(self, f)
+    }
 }
 
 impl Error for TopLevelError {}

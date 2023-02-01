@@ -30,11 +30,11 @@ impl<'arena> Buffer<'arena> {
 
     /// Shrinks the buffer to a new size, discarding the bytes
     /// that no longer fit into it.
-    /// When this method succeeds, [` self.remaining() `] shall
-    /// return [` new_len `].
+    /// When this method succeeds, `self.remaining()` shall
+    /// return `new_len`.
     /// ### Errors
-    /// If [` new_len `] > [` self.remaining() `], this method has no
-    /// effect and Err(()) is returned. The buffer remains in a valid state.
+    /// If `new_len` > `self.remaining()`, this method has no
+    /// effect and `Err(())` is returned. The buffer remains in a valid state.
     pub fn shrink(&mut self, new_len: usize) -> Result<(), ()> {
         if self.remaining() < new_len {
             Err(())

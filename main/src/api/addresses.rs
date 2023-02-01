@@ -11,34 +11,10 @@ use std::str::FromStr;
 use super::parse::Buffer;
 
 /// An opaque wrapper representing an Ipv6 address.
-#[derive(Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone)]
 pub struct Addr {
     addr: net::Ipv6Addr,
     port: u16,
-}
-
-impl PartialEq for Addr {
-    fn eq(&self, other: &Self) -> bool {
-        // This allows to check whether an address is the same as the local socket, when
-        // the socket is bound to the UNSPECIFIED address.
-        self.port == other.port
-            && ((self.addr == net::Ipv6Addr::UNSPECIFIED && other.addr == net::Ipv6Addr::LOCALHOST)
-                || (other.addr == net::Ipv6Addr::UNSPECIFIED
-                    && self.addr == net::Ipv6Addr::LOCALHOST)
-                || self.addr == other.addr)
-    }
-}
-
-impl Hash for Addr {
-    // Explicit impl because PartialEq is explicitly impl too.
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        if self.addr.is_unspecified() {
-            net::Ipv6Addr::LOCALHOST.hash(state);
-        } else {
-            self.addr.hash(state);
-        }
-        self.port.hash(state);
-    }
 }
 
 impl std::fmt::Display for Addr {
@@ -85,6 +61,14 @@ impl Addr {
         bytes.extend(self.addr.octets());
         bytes.extend(self.port.to_be_bytes());
         bytes
+    }
+
+    pub(super) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(super) fn ip(&self) -> net::Ipv6Addr {
+        self.addr
     }
 }
 

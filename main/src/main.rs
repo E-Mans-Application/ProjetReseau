@@ -3,7 +3,8 @@
     option_result_contains,
     map_try_insert,
     io_error_more,
-    result_flattening
+    result_flattening,
+    linked_list_cursors
 )]
 #![deny(
     clippy::complexity,
@@ -35,14 +36,17 @@
     clippy::cast_possible_truncation,
     clippy::print_stderr,
     clippy::pattern_type_mismatch,
-    clippy::nursery
+    clippy::nursery,
+    clippy::linkedlist
 )]
 
 extern crate clap;
+extern crate collections_more;
 extern crate crossbeam;
 extern crate derive_more;
 extern crate rand;
 
+use self::clap::Parser;
 use api::{
     logging::{Printer, VerboseLevel},
     use_client,
@@ -50,17 +54,14 @@ use api::{
 use std::str::FromStr;
 use toplevel::TopLevelError;
 
-use self::clap::Parser;
-
 mod api;
 mod sync;
 mod toplevel;
-mod priority_map;
-
 #[derive(Parser)]
 struct Cli {
     port: u16,
-    first_neighbour: String,
+    #[arg(required = true)]
+    first_neighbours: Vec<String>,
     #[arg(short, long)]
     nickname: Option<String>,
     #[arg(short, long)]
@@ -81,7 +82,7 @@ fn main() -> Result<(), toplevel::TopLevelError> {
 
     use_client(
         args.port,
-        &args.first_neighbour,
+        &args.first_neighbours,
         args.nickname,
         printer,
         verbose_level,
@@ -95,7 +96,7 @@ fn main() -> Result<(), toplevel::TopLevelError> {
                         ));
                     }
                 }
-                Err(_err) =>  return,
+                Err(_err) => return,
             }
         },
     )
