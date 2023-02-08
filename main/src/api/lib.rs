@@ -215,7 +215,7 @@ impl<'arena> NeighbourHood<'arena> {
     }
 
     /// Tells whether `addr` clearly resolves to the local address of the socket.
-    /// 
+    ///
     /// This function is experimental and not exhaustive.
     fn is_me(&self, addr: &Addr) -> bool {
         let local = &self.socket.local_addr;
@@ -225,14 +225,17 @@ impl<'arena> NeighbourHood<'arena> {
         if addr.port() != local.port() {
             return false;
         }
-        if local.ip().is_loopback() {
+
+        if addr.ip().is_loopback() {            
             return true;
         }
 
-        #[cfg(target_os = "unix")] {
-            if let Some(default_interface) = pnet::datalink::interfaces().iter().find(|e| {
-                e.is_up() && !e.is_loopback() && e.ips.iter().any(|ip| ip.is_ipv6())
-            }) {
+        #[cfg(target_os = "unix")]
+        {
+            if let Some(default_interface) = pnet::datalink::interfaces()
+                .iter()
+                .find(|e| e.is_up() && !e.is_loopback() && e.ips.iter().any(|ip| ip.is_ipv6()))
+            {
                 for ip in &default_interface.ips {
                     if ip.is_ipv6() && addr.ip() == ip.ip() {
                         return true;
@@ -314,7 +317,7 @@ impl<'arena> NeighbourHood<'arena> {
     }
 
     /// Dismisses all the neighbours contained in the array `who`.
-    /// The neighbours are removed from the active neighbour map, but are kept from
+    /// The neighbours are removed from the active neighbour map, but are kept in
     /// the potential neighbour map.
     /// A "GoAway" TLV with the given `reason` and `msg` is sent to all the dismissed
     /// neighbours.
@@ -322,10 +325,16 @@ impl<'arena> NeighbourHood<'arena> {
         let msg = Rc::new(NeighbourHood::create_go_away_tlv(reason, msg));
 
         for addr in who {
-            log_info!(self.socket, "Neighbour {0} is now inactive.", addr);
-            self.tva.remove(addr);
+            self.mark_inactive(addr);
             self.socket.send_single_tlv(addr, Rc::clone(&msg));
         }
+    }
+
+    /// Removes a neighbour from the active neighbour map, but keeps it in the potential
+    /// neighbour map.
+    fn mark_inactive(&mut self, addr: &'arena Addr) {
+        log_info!(self.socket, "Neighbour {0} is now inactive.", addr);
+        self.tva.remove(addr);
     }
 
     /// Blocks the neighbour for the specified duration, preventing it from sending
@@ -1229,7 +1238,7 @@ impl<'arena> LocalUser<'arena> {
             }
 
             TagLengthValue::GoAway(_reason, msg) => {
-                self.neighbours.borrow_mut().tva.remove(sender);
+                self.neighbours.borrow_mut().mark_inactive(sender);
 
                 if let Some(Err(err)) = msg {
                     log_anomaly!(

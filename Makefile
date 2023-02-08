@@ -3,3 +3,6 @@ default:
 
 debug:
 	cargo build
+	
+clean:
+	cargo clean
